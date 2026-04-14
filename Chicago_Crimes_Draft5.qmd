@@ -21,6 +21,7 @@ execute:
 ---
 
 **Introduction to Data**
+testing
 
 This project uses Chicago's reported crime data to examine crime patterns across time and location, and to identify which factors impact crime counts. Our primary questions are how total reported crimes have changed over time since 2001, when crimes occur most often during the day, which community areas and police districts experience higher crime counts and how those patterns shift over time, and which types of crimes are associated with higher arrest rates. This analysis uses the City of Chicago Data Portal dataset, which has incident-level records for crimes reported to the Chicago Police Department. Each row represents one reported incident and includes information such as the date/time, location, and crime category.
 
