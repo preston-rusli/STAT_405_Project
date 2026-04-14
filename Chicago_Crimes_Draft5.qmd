@@ -21,7 +21,6 @@ execute:
 ---
 
 **Introduction to Data**
-testing
 
 This project uses Chicago's reported crime data to examine crime patterns across time and location, and to identify which factors impact crime counts. Our primary questions are how total reported crimes have changed over time since 2001, when crimes occur most often during the day, which community areas and police districts experience higher crime counts and how those patterns shift over time, and which types of crimes are associated with higher arrest rates. This analysis uses the City of Chicago Data Portal dataset, which has incident-level records for crimes reported to the Chicago Police Department. Each row represents one reported incident and includes information such as the date/time, location, and crime category.
 
@@ -891,12 +890,9 @@ ggplot(district_df, aes(x = factor(District), y = district_population)) +
   theme_minimal()
 ```
 
+Figure 8: Police Districts Bar Charts
 
-Figure 8: Police Districts Histograms
-
-Based on these plots, it is evident that police districts have a wide range of crime intensity. The first histogram shows the crime totals
-
-
+Based on these plots, it is evident that police districts have a wide range of crime intensity. The first plot shows the crime totals for each district, the second plot shows the crime rate for each district, and the third plot shows each district's population. From the second plot, Districts 7, 11, and 15 have the highest crime rates and have some of the lowest populations. This illustrates that crime is more concentrated relative to the number of residents there. This may be due to several factors including nightlife or entertainment areas, shopping districts, major roads, or schools. In these places, the number of people present can be significantly larger than the number of people who actually live there. It also implies that residential population alone may be an imperfect denominator for measuring crime burden in highly active districts.
 
 {{< pagebreak >}}
 
@@ -908,10 +904,10 @@ library(dplyr)
 library(scales)
 
 location_text_query <- "
-SELECT `Location.Description` AS location
+SELECT `Location Description` AS location
 FROM crimes_clean
-WHERE `Location.Description` IS NOT NULL
-  AND TRIM(`Location.Description`) != ''
+WHERE `Location Description` IS NOT NULL
+  AND TRIM(`Location Description`) != ''
 "
 
 location_raw <- dbGetQuery(con, location_text_query)
@@ -967,7 +963,7 @@ ggplot(location_keywords_df, aes(x = crime_count, y = keyword)) +
   )
 ```
 
-Plot 9
+Figure 9: Text-Mining Bar Chart
 
 The bar chart displays the frequency of key location-type keywords extracted from the Location Description field of the Chicago crimes dataset, spanning from 2001 to the present. A text mining approach was applied by scanning every entry for general place-type keywords such as "street," "residence," "apartment," "sidewalk," and others, allowing granular and varied descriptions to be rolled up into broader, more interpretable categories.
 
@@ -1290,7 +1286,6 @@ ggplot(
     legend.position = "right"
   )
 ```
-
 
 
 ```{r, fig.width = 8, fig.height = 9}
@@ -1643,9 +1638,274 @@ ggplot(
   )
 ```
 
-
-
-
 Killer Plot Idea: Fingerprint Graph
-  
 
+```{r, fig.width=8, fig.height=9, warning=FALSE}
+library(DBI)
+library(RSQLite)
+library(dplyr)
+library(ggplot2)
+library(scales)
+library(tibble)
+library(ggrepel)
+library(forcats)
+
+# --------------------------------
+# Pull beat-level metrics
+# --------------------------------
+finger_df <- dbGetQuery(con, "
+WITH yearly AS (
+  SELECT
+    CAST(District AS INTEGER) AS district_num,
+    printf('%04d', CAST(Beat AS INTEGER)) AS beat,
+    CAST(substr(Date, 7, 4) AS INTEGER) AS year,
+    COUNT(*) AS yearly_crime
+  FROM crimes_clean
+  WHERE District IS NOT NULL
+    AND Beat IS NOT NULL
+    AND Date IS NOT NULL
+    AND CAST(District AS INTEGER) = 11
+    AND substr(printf('%04d', CAST(Beat AS INTEGER)), 1, 2) = '11'
+    AND CAST(substr(Date, 7, 4) AS INTEGER) BETWEEN 2020 AND 2025
+  GROUP BY CAST(District AS INTEGER),
+           printf('%04d', CAST(Beat AS INTEGER)),
+           CAST(substr(Date, 7, 4) AS INTEGER)
+),
+volatility AS (
+  SELECT
+    district_num,
+    beat,
+    AVG(yearly_crime) AS mean_yearly_crime,
+    CASE
+      WHEN AVG(yearly_crime) = 0 THEN 0
+      ELSE sqrt(AVG(yearly_crime * yearly_crime) - AVG(yearly_crime) * AVG(yearly_crime)) / AVG(yearly_crime)
+    END AS crime_cv
+  FROM yearly
+  GROUP BY district_num, beat
+),
+totals AS (
+  SELECT
+    CAST(District AS INTEGER) AS district_num,
+    printf('%04d', CAST(Beat AS INTEGER)) AS beat,
+    COUNT(*) AS total_crime,
+    SUM(CASE
+          WHEN [Primary Type] IN (
+            'HOMICIDE',
+            'ROBBERY',
+            'ASSAULT',
+            'BATTERY',
+            'CRIM SEXUAL ASSAULT',
+            'KIDNAPPING'
+          ) THEN 1 ELSE 0
+        END) AS violent_crime,
+    SUM(CASE
+          WHEN Arrest = 1 OR Arrest = 'TRUE' OR Arrest = 'true' THEN 1 ELSE 0
+        END) AS arrests,
+    AVG(Longitude) AS lon,
+    AVG(Latitude) AS lat
+  FROM crimes_clean
+  WHERE District IS NOT NULL
+    AND Beat IS NOT NULL
+    AND Latitude IS NOT NULL
+    AND Longitude IS NOT NULL
+    AND CAST(District AS INTEGER) = 11
+    AND substr(printf('%04d', CAST(Beat AS INTEGER)), 1, 2) = '11'
+  GROUP BY CAST(District AS INTEGER), printf('%04d', CAST(Beat AS INTEGER))
+)
+SELECT
+  t.district_num,
+  t.beat,
+  t.total_crime,
+  t.violent_crime,
+  t.arrests,
+  t.lon,
+  t.lat,
+  v.mean_yearly_crime,
+  v.crime_cv
+FROM totals t
+LEFT JOIN volatility v
+  ON t.district_num = v.district_num
+ AND t.beat = v.beat
+") %>%
+  as_tibble() %>%
+  mutate(
+    violent_rate = violent_crime / total_crime,
+    arrest_rate  = arrests / total_crime,
+    beat_label   = paste("Beat", beat)
+  )
+
+# --------------------------------
+# Aesthetics
+# Order by distance from district center
+# --------------------------------
+finger_df2 <- finger_df %>%
+  mutate(
+    district_lon = mean(lon, na.rm = TRUE),
+    district_lat = mean(lat, na.rm = TRUE),
+    dist_center = sqrt((lon - district_lon)^2 + (lat - district_lat)^2)
+  ) %>%
+  arrange(dist_center) %>%
+  mutate(
+    beat = factor(beat_label, levels = beat_label),
+    ridge_width = rescale(rank(violent_rate), to = c(0.5, 5)),
+    ridge_alpha = rescale(arrest_rate, to = c(0.40, 1.0)),
+    crime_cv = ifelse(is.na(crime_cv), median(crime_cv, na.rm = TRUE), crime_cv),
+    roughness = rescale(crime_cv, to = c(0.001, 0.012))
+  )
+
+# --------------------------------
+# Whorl ridge generator
+# --------------------------------
+make_whorl_ridge <- function(r, phase = 0, roughness = 0.004, n = 1200) {
+  t <- seq(0, 2*pi, length.out = n)
+
+  rad <- r +
+    0.06 * sin(2*t + phase) +
+    0.03 * sin(5*t + 0.7*phase)
+
+  x <- 0.92 * rad * cos(t)
+  y <- 1.18 * rad * sin(t)
+
+  # off-center core
+  x <- x + 0.22 * exp(-((t - 1.2)^2) / 0.9) - 0.10 * exp(-((t - 4.5)^2) / 0.6)
+  y <- y + 0.08 * sin(t - 0.8)
+
+  # subtle roughness from volatility
+  x <- x + roughness * sin(20*t + phase) + 0.5 * roughness * cos(33*t + 0.4*phase)
+  y <- y + roughness * cos(18*t + 0.3*phase)
+
+  tibble(x = x, y = y, t = t)
+}
+
+# --------------------------------
+# Smudge / degradation mask
+# --------------------------------
+apply_smudge <- function(df, strength = 0.22) {
+  keep_prob <- 1 - strength * pmax(0, scales::rescale(df$x + 0.7 * df$y, to = c(0, 1)))
+  keep <- runif(nrow(df)) < keep_prob
+  out <- df
+  out[!keep, c("x", "y")] <- NA
+  out
+}
+
+# --------------------------------
+# Build all ridges
+# Outer ridges = farther beats
+# --------------------------------
+build_whorl_fingerprint <- function(df) {
+  beat_levels <- levels(df$beat)
+  r_vals <- seq(0.10, 1.48, length.out = length(beat_levels))
+
+  ridge_list <- vector("list", length(beat_levels))
+
+  for (i in seq_along(beat_levels)) {
+    seg <- df %>% filter(beat == beat_levels[i])
+
+    ridge <- make_whorl_ridge(
+      r = r_vals[i],
+      phase = i * 0.25,
+      roughness = seg$roughness[1],
+      n = 1400
+    )
+
+    ridge <- apply_smudge(ridge, strength = 0.18)
+
+    ridge$beat <- as.character(seg$beat[1])
+    ridge$beat_color <- as.character(seg$beat[1])
+    ridge$total_crime <- seg$total_crime[1]
+    ridge$ridge_width <- seg$ridge_width[1]
+    ridge$ridge_alpha <- seg$ridge_alpha[1]
+    ridge$group_id <- paste0("ridge", i)
+
+    ridge_list[[i]] <- ridge
+  }
+
+  bind_rows(ridge_list)
+}
+
+fp_whorl <- build_whorl_fingerprint(finger_df2)
+
+# --------------------------------
+# Core fill: extra dense inner ridges
+# --------------------------------
+core_extra <- bind_rows(lapply(1:5, function(j) {
+  seg <- finger_df2 %>% slice_tail(n = 5) %>% slice(j)
+
+  ridge <- make_whorl_ridge(
+    r = c(0.035, 0.055, 0.075, 0.090, 0.105)[j],
+    phase = 2 + j * 0.18,
+    roughness = seg$roughness * 0.5,
+    n = 1400
+  )
+
+  ridge$beat <- as.character(seg$beat)
+  ridge$beat_color <- as.character(seg$beat)
+  ridge$total_crime <- seg$total_crime
+  ridge$ridge_width <- max(0.35, seg$ridge_width * 0.8)
+  ridge$ridge_alpha <- seg$ridge_alpha
+  ridge$group_id <- paste0("core", j)
+  ridge
+}))
+
+fp_whorl <- bind_rows(fp_whorl, core_extra)
+
+# --------------------------------
+# Label positions from ridge data
+# --------------------------------
+beat_labels <- fp_whorl %>%
+  filter(!grepl("^core", group_id)) %>%
+  filter(!is.na(x), !is.na(y)) %>%
+  group_by(group_id, beat, total_crime) %>%
+  slice_max(order_by = x, n = 1, with_ties = FALSE) %>%
+  ungroup() %>%
+  arrange(desc(total_crime)) %>%
+  slice_head(n = 8)
+
+# --------------------------------
+# Plot
+# --------------------------------
+ggplot(
+  fp_whorl,
+  aes(
+    x = x, y = y, group = group_id,
+    color = beat_color,
+    linewidth = ridge_width,
+    alpha = ridge_alpha
+  )
+) +
+  geom_path(lineend = "round", linejoin = "round") +
+  geom_label_repel(
+    data = beat_labels,
+    aes(x = x, y = y, label = beat),
+    inherit.aes = FALSE,
+    color = "black",
+    size = 3,
+    fontface = "bold",
+    box.padding = 0.22,
+    point.padding = 0.10,
+    label.size = 0.15,
+    segment.color = "#4a3428",
+    segment.size = 0.3,
+    fill = alpha("white", 0.80),
+    seed = 123,
+    max.overlaps = Inf,
+    direction = "y",
+    show.legend = FALSE
+  ) +
+  coord_equal(xlim = c(-1.65, 2.05), ylim = c(-1.95, 1.85), clip = "off") +
+  scale_color_viridis_d(guide = "none") +
+  scale_linewidth(range = c(0.4, 2.0), guide = "none") +
+  scale_alpha(range = c(0.45, 0.95), guide = "none") +
+  labs(
+    title = "District 11 Crime Fingerprint",
+    subtitle = "Outer ridges = beats farther from the district center"
+  ) +
+  theme_void() +
+  theme(
+    plot.background = element_rect(fill = "#d8b186", color = NA),
+    panel.background = element_rect(fill = "#d8b186", color = NA),
+    plot.title = element_text(face = "bold", hjust = 0.5, color = "#2b1b14"),
+    plot.subtitle = element_text(hjust = 0.5, color = "#2b1b14"),
+    plot.margin = margin(10, 55, 10, 10)
+  )
+```
