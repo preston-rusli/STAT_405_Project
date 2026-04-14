@@ -1,0 +1,1650 @@
+---
+title: "Chicago Crime Patterns (2001- Present)"
+author: 
+- "Preston Rusli"
+- "Christopher White"
+- "Naidhruv Iyer"
+date: "17 February 2026"
+format:
+  pdf:
+    code-overflow: wrap
+pdf-engine: xelatex
+editor: visual
+fontsize: 10pt
+geometry: margin=1in
+toc: true
+toc-depth: 2
+execute:
+  echo: false
+  message: false
+  warning: false
+---
+
+**Introduction to Data**
+
+This project uses Chicago's reported crime data to examine crime patterns across time and location, and to identify which factors impact crime counts. Our primary questions are how total reported crimes have changed over time since 2001, when crimes occur most often during the day, which community areas and police districts experience higher crime counts and how those patterns shift over time, and which types of crimes are associated with higher arrest rates. This analysis uses the City of Chicago Data Portal dataset, which has incident-level records for crimes reported to the Chicago Police Department. Each row represents one reported incident and includes information such as the date/time, location, and crime category.
+
+**Key variables**
+
+Several variables are particularly important for this project. The incident date and time are used to extract the hour, month, and year. The Primary Type field is used for yearly trend plots and heatmaps. The Location fields are used for spatial concentration and neighborhood and district-level analysis. The Arrest and Domestic indicators are used to analyze arrest outcomes and differences between domestic and non-domestic incidents.
+
+**Preprocessing/Transformations**
+
+To ensure that the data is ready for analysis, several transformations were applied. For summaries, data is restricted to specific year ranges depending on the plot. Year and count-related fields were converted into numeric form where needed for plotting and modeling. Furthermore, incident-level records were aggregated into counts across different units of time or geography, in order to illustrate the patterns more clearly.
+
+\begin{large}
+\textbf{Plots}
+\end{large}
+
+To understand how Chicago crime levels change over time, we aggregate crimes into weekly totals from 2001–2025 and overlay a LOESS smoother to highlight the long-run trend while filtering out week-to-week noise.
+
+```{r}
+library(DBI)
+library(RSQLite)
+library(readr)
+
+con <- dbConnect(SQLite(), "chicago_crime.sqlite")
+
+#load crime data
+crime_raw <- read_csv("chicago_crime.csv", show_col_types = FALSE)
+dbWriteTable(con, "crimes", crime_raw, overwrite = TRUE)
+
+#load community area population
+pop_raw <- read_csv("acs_community_area_population.csv", show_col_types = FALSE)
+dbWriteTable(con, "population", pop_raw, overwrite = TRUE)
+
+# create indexes
+dbExecute(con, "CREATE INDEX IF NOT EXISTS idx_crimes_date ON crimes(Date)")
+dbExecute(con, "CREATE INDEX IF NOT EXISTS idx_crimes_primary_type ON crimes([Primary Type])")
+dbExecute(con, "CREATE INDEX IF NOT EXISTS idx_crimes_community_area ON crimes([Community Area])")
+dbExecute(con, "CREATE INDEX IF NOT EXISTS idx_crimes_arrest ON crimes(Arrest)")
+
+dbExecute(con, "DROP TABLE IF EXISTS crimes_clean")
+dbExecute(con, "
+  CREATE TABLE crimes_clean AS
+  SELECT *
+  FROM crimes
+  WHERE Date IS NOT NULL
+    AND Year BETWEEN 2001 AND 2025
+    AND [Primary Type] IS NOT NULL
+    AND [Primary Type] != ''
+")
+
+crime_counts <- dbGetQuery(con, "
+  SELECT
+    [Primary Type],
+    COUNT(*) AS crime_count
+  FROM crimes_clean
+  GROUP BY [Primary Type]
+  ORDER BY crime_count DESC
+")
+
+main_crimes <- dbGetQuery(con, "
+SELECT
+  CASE
+    WHEN [Primary Type] IN (
+      'THEFT', 'BURGLARY', 'MOTOR VEHICLE THEFT',
+      'CRIMINAL DAMAGE', 'CRIMINAL TRESPASS', 'ARSON'
+    ) THEN 'Theft / Property'
+
+    WHEN [Primary Type] IN (
+      'DECEPTIVE PRACTICE', 'OTHER OFFENSE', 'NON-CRIMINAL'
+    ) THEN 'Fraud / Administrative'
+
+    WHEN [Primary Type] IN (
+      'BATTERY', 'ASSAULT', 'HOMICIDE',
+      'KIDNAPPING', 'INTIMIDATION', 'STALKING'
+    ) THEN 'Violent Personal Crime'
+
+    WHEN [Primary Type] = 'ROBBERY'
+      THEN 'Robbery'
+
+    WHEN [Primary Type] IN (
+      'NARCOTICS', 'OTHER NARCOTIC VIOLATION'
+    ) THEN 'Drug Offenses'
+
+    WHEN [Primary Type] IN (
+      'WEAPONS VIOLATION', 'CONCEALED CARRY LICENSE VIOLATION',
+      'INTERFERENCE WITH PUBLIC OFFICER'
+    ) THEN 'Weapons / Law Enforcement'
+
+    WHEN [Primary Type] IN (
+      'SEX OFFENSE', 'CRIM SEXUAL ASSAULT', 'CRIMINAL SEXUAL ASSAULT',
+      'PROSTITUTION', 'OFFENSE INVOLVING CHILDREN',
+      'HUMAN TRAFFICKING', 'PUBLIC INDECENCY', 'OBSCENITY'
+    ) THEN 'Sexual / Exploitation Offenses'
+
+    WHEN [Primary Type] IN (
+      'PUBLIC PEACE VIOLATION', 'LIQUOR LAW VIOLATION',
+      'GAMBLING', 'RITUALISM', 'DOMESTIC VIOLENCE'
+    ) THEN 'Public Order / Vice'
+  END AS Crime_Group,
+  COUNT(*) AS crime_count
+FROM crimes_clean
+WHERE [Primary Type] IS NOT NULL
+GROUP BY Crime_Group
+ORDER BY crime_count DESC;")
+```
+
+```{r, message=FALSE}
+library(DBI)
+library(dplyr)
+library(ggplot2)
+library(scales)
+library(lubridate)
+
+crime_daily <- dbGetQuery(con, "
+  SELECT
+    date(
+      substr(Date, 7, 4) || '-' ||
+      substr(Date, 1, 2) || '-' ||
+      substr(Date, 4, 2)
+    ) AS day,
+    COUNT(*) AS count
+  FROM crimes_clean
+  WHERE Date IS NOT NULL
+    AND CAST(substr(Date, 7, 4) AS INTEGER) BETWEEN 2001 AND 2025
+  GROUP BY date(
+    substr(Date, 7, 4) || '-' ||
+    substr(Date, 1, 2) || '-' ||
+    substr(Date, 4, 2)
+  )
+  ORDER BY day
+")
+
+crime_weekly <- dbGetQuery(con, "
+  SELECT
+    date(
+      date(
+        substr(Date, 7, 4) || '-' ||
+        substr(Date, 1, 2) || '-' ||
+        substr(Date, 4, 2)
+      ),
+      '-' || ((strftime('%w',
+        date(
+          substr(Date, 7, 4) || '-' ||
+          substr(Date, 1, 2) || '-' ||
+          substr(Date, 4, 2)
+        )
+      ) + 6) % 7) || ' days'
+    ) AS week,
+    COUNT(*) AS count
+  FROM crimes_clean
+  WHERE Date IS NOT NULL
+    AND CAST(substr(Date, 7, 4) AS INTEGER) BETWEEN 2001 AND 2025
+  GROUP BY week
+  ORDER BY week
+")
+
+crime_daily$day <- as.Date(crime_daily$day)
+crime_daily$count <- as.numeric(crime_daily$count)
+crime_weekly$week <- as.Date(crime_weekly$week)
+crime_weekly$count <- as.numeric(crime_weekly$count)
+
+weekly_loess <- ggplot(crime_weekly, aes(x = week, y = count)) +
+  geom_line(aes(color = "Weekly totals"),
+            linewidth = 0.35, alpha = 0.4) +
+  # LOESS curve
+  geom_smooth(aes(color = "LOESS trend"),
+              method = "loess",
+              se = FALSE,
+              span = 0.25,
+              linewidth = 0.7) +
+  # COVID-19
+  geom_vline(xintercept = as.Date("2020-03-01"),
+             linetype = "dashed", linewidth = 0.4, alpha = 0.7) +
+  annotate("text",
+           x = as.Date("2020-03-01"), y = Inf,
+           label = "COVID-19 (Mar 2020)",
+           vjust = 1.6, hjust = -0.05, size = 3) +
+  scale_x_date(
+    limits = range(crime_weekly$week, na.rm = TRUE),
+    breaks = seq(min(crime_weekly$week, na.rm = TRUE),
+                 max(crime_weekly$week, na.rm = TRUE),
+                 by = "2 years"),
+    labels = scales::date_format("%Y"),
+    expand = c(0, 0)
+  ) +
+  scale_y_continuous(limits = c(0, NA), labels = scales::comma) +
+ scale_color_manual(
+   name = NULL,
+   breaks = c("Weekly totals", "LOESS trend"),
+   values = c("Weekly totals" = "gray25", "LOESS trend" = "blue")
+ ) +
+  guides(color = guide_legend(override.aes = list(alpha = 1, linewidth = 1))) +
+  labs(
+    title = "Weekly Crimes with Smoothed Trend",
+    x = "Year",
+    y = "Number of reported crimes (weekly)",
+    caption = "Source: City of Chicago Data Portal"
+  ) +
+  theme_minimal(base_size = 12) +
+  theme(
+    panel.grid.minor = element_blank(),
+    legend.position = "top",
+    legend.justification = "center"
+  )
+
+weekly_loess
+```
+
+**Figure 1: Time Series**
+
+The weekly totals plot with a LOESS smoother shows a strong long-run decline in reported crime from the 2001 through roughly the mid-2010s, followed by a flatter period and then a noticeable dip around 2020–2021 near the COVID-19 marker. After COVID-19, there is a slight rebound followed by a slight decline in 2025. Looking at the weekly totals, there is a clear cyclical pattern throughout the years, illustrating that middle months have higher crimes and early and late months have less crimes. Taken together, these plots suggest that Chicago crime levels are shaped by both slow structural trends over decades and predictable yearly seasonal cycles, with major societal disruptions (such as COVID-19) capable of producing temporary deviations from the typical pattern. This motivates later analysis by crime type and weather effects rather than relying on overall totals alone.
+
+{{< pagebreak >}}
+
+```{r, echo=FALSE}
+library(DBI)
+library(ggplot2)
+library(scales)
+library(dplyr)
+
+hour_counts <- dbGetQuery(con, "
+  SELECT
+    CASE
+      WHEN substr(Date, 21, 2) = 'AM' AND substr(Date, 12, 2) = '12' THEN 0
+      WHEN substr(Date, 21, 2) = 'AM' THEN CAST(substr(Date, 12, 2) AS INTEGER)
+      WHEN substr(Date, 21, 2) = 'PM' AND substr(Date, 12, 2) = '12' THEN 12
+      ELSE CAST(substr(Date, 12, 2) AS INTEGER) + 12
+    END AS Hour,
+    COUNT(*) AS crime_count
+  FROM crimes_clean
+  WHERE Date IS NOT NULL
+    AND CAST(substr(Date, 7, 4) AS INTEGER) BETWEEN 2001 AND 2025
+  GROUP BY Hour
+  ORDER BY Hour
+")
+
+hour_labels <- c(
+  "12AM","1AM","2AM","3AM","4AM","5AM","6AM","7AM","8AM","9AM","10AM","11AM",
+  "12PM","1PM","2PM","3PM","4PM","5PM","6PM","7PM","8PM","9PM","10PM","11PM"
+)
+
+hour_counts <- hour_counts %>%
+  filter(!Hour %in% c(0, 12)) %>%
+  mutate(HourLabel = factor(hour_labels[Hour + 1], levels = hour_labels))
+
+ggplot(hour_counts, aes(x = HourLabel, y = crime_count)) +
+  geom_col(fill = "lightblue", color = "white") +
+  scale_x_discrete(drop = FALSE) +
+  labs(
+    title = "Crime by Hour of Day",
+    x = "Time of Day",
+    y = "Number of Crimes"
+  ) +
+  scale_y_continuous(labels = comma) +
+  theme_minimal() +
+  theme(
+    axis.text.x = element_text(angle = 45, hjust = 1)
+  )
+```
+
+**Figure 2: Histogram of Crime By Hour of Day**
+
+To understand when reported crimes tend to occur during a typical day, we first examine the time-of-day distribution of incidents. Using the incident time stamps, we extract the hour (0–23) for each report and visualize the frequency of crimes across the 24-hour cycle. This helps identify peak hours and quieter periods. This histogram shows the average daily cycle of reported crimes, with the lowest activity roughly around 4am-6am, and highest activity at 3pm and 6-9pm. Crime activity gradually rises throughout the morning hours, and gradually declines after about 6pm. For this plot, 12am and 12pm data were excluded since it seemed to be unusually high perhaps being defaults when a specific time was not available.
+
+{{< pagebreak >}}
+
+```{r, echo=FALSE}
+library(DBI)
+library(dplyr)
+library(ggplot2)
+
+monthly_counts <- dbGetQuery(con, "
+  SELECT
+    CAST(substr(Date, 7, 4) AS INTEGER) AS year,
+    CAST(substr(Date, 1, 2) AS INTEGER) AS month_num,
+    COUNT(*) AS count
+  FROM crimes_clean
+  WHERE Date IS NOT NULL
+    AND CAST(substr(Date, 7, 4) AS INTEGER) BETWEEN 2001 AND 2025
+  GROUP BY year, month_num
+  ORDER BY year, month_num
+")
+
+monthly_counts$month <- factor(month.abb[monthly_counts$month_num], levels = rev(month.abb))
+monthly_counts$log_count <- log1p(monthly_counts$count)
+
+ggplot(monthly_counts, aes(x = factor(year), y = month, fill = log_count)) +
+  geom_tile(color = NA) +
+  scale_fill_gradientn(
+    colors = c("#fcabae", "#fb8861", "#b63679", "#51127c", "#000005"),
+    name = "log1p(count)"
+  ) +
+  labs(
+    title = "Monthly Crime Counts (log-transformed scale), 2001–2025",
+    x = "Year",
+    y = "Month"
+  ) +
+  theme_minimal() +
+  theme(
+    panel.grid = element_blank(),
+    axis.text.x = element_text(angle = 45, hjust = 1)
+  )
+```
+
+**Figure 3: Heatmap**
+
+This is a heatmap showing the distribution of crime throughout the 12 months of a year for years 2001 to 2025. Lighter pinks represent months with lower levels of recorded crime and darker magentas and purples show higher rates of recorded crime. On first glance, it is evident that there is a gradual decline throughout the years, with a notable disruption in 2020-2021 due to COVID-19. A log-transformed color scale is used to improve contrast between months and years, since raw counts would compress the variation into a narrow range of colors.
+
+It also appears that February and to some degree, March, tend to have the lowest crime rates out of the entire year. Chicago is known to have extreme winters that are life-threatening to anyone without shelter and constant access to heating. This is an environmental condition that would make it more difficult for certain types of crimes to occur (theft, robbery, assault, battery, burglary, to name a few). Further analysis on this trend could look to see if the drop in these crimes is associated with an increase in other crimes like deceptive practice, narcotics, crimes against children, or domestic violence.
+
+{{< pagebreak >}}
+
+```{r, echo=FALSE, message=FALSE, warning=FALSE, fig.width=8, fig.height=8}
+library(DBI)
+library(sf)
+library(dplyr)
+library(ggplot2)
+library(readr)
+library(scales)
+library(stringr)
+library(ggrepel)
+library(tidyr)
+library(grid)
+
+# Crime aggregation in SQLite
+crime_by_area <- dbGetQuery(con, "
+  SELECT
+    CAST([Community Area] AS INTEGER) AS Community_Area,
+    COUNT(*) AS crime_total_2020_2024,
+    COUNT(*) / 5.0 AS crime_avg_per_year
+  FROM crimes_clean
+  WHERE Date IS NOT NULL
+    AND [Community Area] IS NOT NULL
+    AND CAST(substr(Date, 7, 4) AS INTEGER) BETWEEN 2020 AND 2024
+  GROUP BY CAST([Community Area] AS INTEGER)
+  ORDER BY Community_Area
+")
+
+areas <- st_read("Boundaries_-_Community_Areas.geojson", quiet = TRUE) %>%
+  mutate(
+    Community_Area = as.integer(area_numbe),
+    comm_name = str_to_upper(str_squish(community))
+  )
+
+pop <- read_csv("acs_community_area_population.csv", show_col_types = FALSE) %>%
+  transmute(
+    comm_name = str_to_upper(str_squish(`Community Area`)),
+    population = as.numeric(`Total Population`)
+  )
+
+map_df <- areas %>%
+  left_join(crime_by_area, by = "Community_Area") %>%
+  left_join(pop, by = "comm_name") %>%
+  mutate(
+    crime_avg_per_year = replace_na(crime_avg_per_year, 0),
+    crimes_per_1000_per_year = if_else(
+      !is.na(population) & population > 0,
+      1000 * crime_avg_per_year / population,
+      NA_real_
+    )
+  )
+
+# cap max values for better color contrast
+cap <- quantile(map_df$crimes_per_1000_per_year, 0.95, na.rm = TRUE)
+map_df <- map_df %>%
+  mutate(rate_plot = pmin(crimes_per_1000_per_year, cap))
+
+# top 5 labels by rate
+top5 <- map_df %>%
+  st_drop_geometry() %>%
+  filter(is.finite(crimes_per_1000_per_year)) %>%
+  arrange(desc(crimes_per_1000_per_year)) %>%
+  slice(1:5) %>%
+  transmute(
+    Community_Area,
+    comm_name,
+    rate = crimes_per_1000_per_year
+  )
+
+label_pts <- st_point_on_surface(map_df)
+
+label_df <- label_pts %>%
+  left_join(top5, by = "Community_Area") %>%
+  filter(!is.na(rate))
+
+label_xy <- label_df %>%
+  mutate(
+    x = st_coordinates(geometry)[, 1],
+    y = st_coordinates(geometry)[, 2],
+    label = paste0(str_to_title(comm_name.x), "\n", sprintf("%.1f", rate))
+  ) %>%
+  st_drop_geometry()
+
+ggplot(map_df) +
+  geom_sf(aes(fill = rate_plot), color = "white", linewidth = 0.2) +
+  geom_label_repel(
+    data = label_xy,
+    aes(x = x, y = y, label = label),
+    size = 3,
+    fill = "white",
+    alpha = 0.85,
+    label.size = 0,
+    box.padding = 0.35,
+    point.padding = 0.2,
+    min.segment.length = 0,
+    segment.size = 0.3,
+    segment.alpha = 0.8,
+    max.overlaps = Inf
+  ) +
+  scale_fill_viridis_c(
+    option = "C",
+    trans = "sqrt",
+    direction = -1,
+    breaks = pretty_breaks(n = 5),
+    labels = ~ sprintf("%.1f", .x),
+    name = "Crimes per 1,000 per year",
+    na.value = "grey90"
+  ) +
+  guides(fill = guide_colorbar(
+    title.position = "top",
+    title.hjust = 0.5,
+    label.position = "bottom",
+    barwidth = unit(4.5, "in"),
+    barheight = unit(0.25, "in"),
+    ticks = TRUE
+  )) +
+  coord_sf(datum = NA) +
+  labs(
+    title = "Average Annual Crime Rate by Community Area (2020–2024)",
+    subtitle = "Rate = (average yearly crimes in 2020–2024) / (ACS 2023 population), per 1,000 residents",
+    caption = paste0(
+      "Sources: City of Chicago Data Portal (crimes, 2020–2024); ACS community area population (2023).\n",
+      "Color scale capped at the 95th percentile for readability."
+    )
+  ) +
+  theme_minimal(base_size = 12) +
+  theme(
+    panel.grid = element_blank(),
+    axis.title = element_blank(),
+    axis.text = element_blank(),
+    axis.ticks = element_blank(),
+    legend.position = "bottom",
+    legend.title = element_text(size = 11),
+    legend.text = element_text(size = 10),
+    legend.box.margin = margin(t = 6, r = 0, b = 0, l = 0),
+    legend.margin = margin(t = 2, r = 2, b = 2, l = 2),
+    plot.title = element_text(size = 15, face = "bold"),
+    plot.subtitle = element_text(size = 11),
+    plot.caption = element_text(size = 9),
+    plot.margin = margin(10, 10, 10, 10)
+  )
+```
+
+**Figure 4 (cloropleth)**
+
+Raw crime counts can be misleading because community areas vary widely in population size. To make comparisons better, this figure maps an average annual crime rate for each community area from 2020-2024. This is computed by dividing the area's average yearly number of reported incidents by its ACS 2023 residential population, expressed per 1000 residents. This per-capita approach highlights where crime is most frequent relative to the number of residents rather than where the most incidents happen in total.
+
+The map reveals a high geographic varaiation in crime rate across Chicago, even after normalizing by population. Lighter (orange/yellow) areas cluster in lower-rate ranges, while darker (purple) areas indicate higher rates. Several community areas stand out as hot spots, labeled on the map, suggesting that elevated per-capita crime rate is concentrated instead of uniformly distributed across the city during 2020-2024.
+
+However, these patterns should not be interpreted as purely risk or danger. Several confounding factors can impact rates in certain areas including population density, transit hubs, and nightlife. Furthermore, difference in reporting behavior and policing practices across police districts can also affect recorded incident counts. Therefore, this map does not prove a causal explanation of higher crime rates in some areas. Methodologically, a five-year average is used which reduces noise from annual fluctuations. The color scale is capped at the 95th percentile, which prevents extreme values from hiding variation and compresses the areas with the highest rates. Overall, this map gives a clear starting point for deeper analysis, particularly breaking rates down by crime type and comparing time periods.
+
+{{< pagebreak >}}
+
+```{r, echo=FALSE}
+library(DBI)
+library(dplyr)
+library(ggplot2)
+
+crime_recent <- dbGetQuery(con, "
+  SELECT
+    Arrest,
+    Domestic,
+    CASE
+      WHEN [Primary Type] IN (
+        'THEFT', 'BURGLARY', 'MOTOR VEHICLE THEFT',
+        'CRIMINAL DAMAGE', 'CRIMINAL TRESPASS', 'ARSON'
+      ) THEN 'Theft / Property'
+
+      WHEN [Primary Type] IN (
+        'DECEPTIVE PRACTICE', 'OTHER OFFENSE', 'NON-CRIMINAL'
+      ) THEN 'Fraud / Administrative'
+
+      WHEN [Primary Type] IN (
+        'BATTERY', 'ASSAULT', 'HOMICIDE',
+        'KIDNAPPING', 'INTIMIDATION', 'STALKING'
+      ) THEN 'Violent Personal Crime'
+
+      WHEN [Primary Type] = 'ROBBERY'
+        THEN 'Robbery'
+
+      WHEN [Primary Type] IN (
+        'NARCOTICS', 'OTHER NARCOTIC VIOLATION'
+      ) THEN 'Drug Offenses'
+
+      WHEN [Primary Type] IN (
+        'WEAPONS VIOLATION', 'CONCEALED CARRY LICENSE VIOLATION',
+        'INTERFERENCE WITH PUBLIC OFFICER'
+      ) THEN 'Weapons / Law Enforcement'
+
+      WHEN [Primary Type] IN (
+        'SEX OFFENSE', 'CRIM SEXUAL ASSAULT', 'CRIMINAL SEXUAL ASSAULT',
+        'PROSTITUTION', 'OFFENSE INVOLVING CHILDREN',
+        'HUMAN TRAFFICKING', 'PUBLIC INDECENCY', 'OBSCENITY'
+      ) THEN 'Sexual / Exploitation Offenses'
+
+      WHEN [Primary Type] IN (
+        'PUBLIC PEACE VIOLATION', 'LIQUOR LAW VIOLATION',
+        'GAMBLING', 'RITUALISM', 'DOMESTIC VIOLENCE'
+      ) THEN 'Public Order / Vice'
+    END AS Crime_Group,
+    CAST(substr(Date, 7, 4) AS INTEGER) AS Year,
+    CASE
+      WHEN substr(Date, 21, 2) = 'AM' AND substr(Date, 12, 2) = '12' THEN 0
+      WHEN substr(Date, 21, 2) = 'AM' THEN CAST(substr(Date, 12, 2) AS INTEGER)
+      WHEN substr(Date, 21, 2) = 'PM' AND substr(Date, 12, 2) = '12' THEN 12
+      ELSE CAST(substr(Date, 12, 2) AS INTEGER) + 12
+    END AS Hour
+  FROM crimes_clean
+  WHERE Date IS NOT NULL
+    AND CAST(substr(Date, 7, 4) AS INTEGER) >= 2010
+    AND Arrest IS NOT NULL
+    AND Domestic IS NOT NULL
+    AND [Primary Type] IS NOT NULL
+")
+
+crime_model <- crime_recent %>%
+  filter(!is.na(Crime_Group)) %>%
+  mutate(
+    Arrest = as.logical(Arrest),
+    Domestic = factor(Domestic),
+    Crime_Group = droplevels(factor(Crime_Group))
+  )
+crime_model$Crime_Group <- relevel(crime_model$Crime_Group, ref = "Theft / Property")
+
+fit <- glm(Arrest ~ Domestic + Crime_Group + Hour + Year,
+           data = crime_model, family = binomial())
+
+s <- summary(fit)$coefficients
+
+coef_df <- data.frame(
+  term = rownames(s),
+  estimate = s[, "Estimate"],
+  std.error = s[, "Std. Error"],
+  stringsAsFactors = FALSE
+)
+
+coef_df <- subset(coef_df, term != "(Intercept)")
+
+coef_df$or <- exp(coef_df$estimate)
+coef_df$conf.low <- exp(coef_df$estimate - 1.96 * coef_df$std.error)
+coef_df$conf.high <- exp(coef_df$estimate + 1.96 * coef_df$std.error)
+
+coef_df$label <- coef_df$term
+coef_df$label <- gsub("^Crime_Group", "", coef_df$label)
+coef_df$label <- gsub("^DomesticTRUE$", "Domestic: Yes", coef_df$label)
+coef_df$label <- gsub("^DomesticFALSE$", "Domestic: No", coef_df$label)
+coef_df$label <- gsub("^Domestic1$", "Domestic: Yes", coef_df$label)
+coef_df$label <- gsub("^Hour$", "Hour (per 1 hour)", coef_df$label)
+coef_df$label <- gsub("^Year$", "Year (per 1 year)", coef_df$label)
+
+coef_df$label <- reorder(coef_df$label, coef_df$or)
+coef_plot <- subset(coef_df, label != "Drug Offenses")
+coef_df$or <- exp(coef_df$estimate)
+
+ggplot(coef_plot, aes(x = or, y = label)) +
+  geom_point(size = 1) +
+  geom_errorbar(aes(xmin = conf.low, xmax = conf.high), width = 0.15) +
+  geom_vline(xintercept = 1, linetype = 2) +
+  scale_x_log10() +
+  labs(
+    title = "Factors Associated with Arrest",
+    subtitle = "Odds ratios from logistic regression; Drug Offenses omitted from display",
+    x = "Odds ratio (log scale)",
+    y = NULL
+  ) +
+  theme_minimal()
+
+levels(crime_model$Crime_Group)
+coef_plot[, c("label", "or", "conf.low", "conf.high")]
+```
+
+**Plot 5 (coefficient plot)**
+
+To examine which factors are most strongly linked to whether an incident leads to an arrest, a logistic regression model is fitted where the outcome is Arrest (yes/no). Crime categories are grouped into eight main crime groups to focus on substantive patterns rather than just raw frequency rankings. This also helps interpretability and broader coverage of the data.
+
+The predictors include Crime Group, Domestic (yes/no), and time variables, Hour and Year. The plot illustrates the model results as odd ratios with confidence intervals on a logarithmic scale, making it easier to compare factors linked to higher arrest odds versus lower arrest odds.
+
+In this plot, the dashed vertical line at odds ratio = 1 represents no difference in arrest odds. Points to the right of 1 mean higher arrest odds, while points to the left of 1 indicate lower arrest odds, holding the other predictors constant. The reference category is Theft/Property, so all other coefficients are compared relative to Theft/Property, holding the other variables fixed. The primary correlation is that crime type is the key driver of arrest probability. Relative to Theft/Property crimes, offenses in the Weapons / Law Enforcement and Public Order / Vice categories have the highest odds of arrest, while Sexual /Exploitation Offenses and Violent Personal Crime are also associated with elevated arrest odds. In contrast, Robbery is associated with lower odds of arrest than the reference group. This is likely because robbery is often difficult to be cleared through arrest due to fast movement, limited identifying information, and fewer immediate leads. The effects of Hour, Domestic status, and year are comparatively small, suggesting that crime group is the strongest predictor of arrest in this model.
+
+{{< pagebreak >}}
+
+```{r, echo=FALSE}
+top_types <- dbGetQuery(con, "
+  SELECT [Primary Type], COUNT(*) AS n
+  FROM crimes
+  GROUP BY [Primary Type]
+  ORDER BY n DESC
+  LIMIT 5
+")$`Primary Type`
+
+crime_plot <- dbGetQuery(con, "
+  SELECT
+    [Primary Type],
+    CASE
+      WHEN substr(Date, 12, 2) = '12' AND substr(Date, 21, 2) = 'AM' THEN 0
+      WHEN substr(Date, 21, 2) = 'AM' THEN CAST(substr(Date, 12, 2) AS INTEGER)
+      WHEN substr(Date, 12, 2) = '12' AND substr(Date, 21, 2) = 'PM' THEN 12
+      ELSE CAST(substr(Date, 12, 2) AS INTEGER) + 12
+    END AS Hour
+  FROM crimes
+  WHERE [Primary Type] IN (
+    SELECT [Primary Type]
+    FROM crimes
+    GROUP BY [Primary Type]
+    ORDER BY COUNT(*) DESC
+    LIMIT 5
+  )
+")
+
+ggplot(crime_plot,
+       aes(x = `Primary Type`, y = Hour, fill = `Primary Type`)) +
+  geom_violin(trim = FALSE) +
+  coord_flip() +
+  labs(
+    title = "Distribution of Crime Time by Major Crime Type",
+    y = "Hour of Day",
+    x = "Major Crime Type"
+  ) +
+  theme_minimal() +
+  theme(legend.position = "none")
+```
+
+**Plot 6 (violin plot)**
+
+Crime patterns are shaped not only by overall frequency but also by the interaction between offense type and time of occurrence. Certain crimes may be more likely to occur during specific periods of the day due to environmental, economic, or behavioral factors. To explore these differences, we construct a violin plot displaying the full distribution of hourly crime occurrence times for the most common crime categories. Unlike a boxplot or histogram, a violin plot visualizes the density of observations across the full 24-hour range, revealing clustering, skewness, and multimodal patterns within each crime type. This visualization allows us to compare temporal signatures across crime categories and identify whether distinct offense types follow different daily rhythms.
+
+The violin plot reveals substantial variation in the temporal distribution of different crime types. Some categories may show pronounced peaks during daytime hours, while others exhibit density concentrated in the evening or overnight periods. Because theft-related offenses show a strong daytime concentration, this may reflect commercial activity, retail operations, and increased public presence. Criminal damage displays evening clustering, and this may align with nightlife, social gatherings, and alcohol-related activity. Narcotics exhibits bimodal patterns (two distinct peaks), this suggests multiple underlying situational drivers across the day. These patterns indicate that crime timing is not homogeneous across categories. Instead, each offense type has its own temporal structure.
+
+The violin plot reveals substantial variation in the temporal distribution of different crime types. Some categories show pronounced peaks during daytime hours, while others exhibit density concentrated in the evening or overnight periods. Because theft-related offenses show a strong daytime concentration, this may reflect commercial activity, retail operations, and increased public presence. Criminal damage displays evening clustering, and this may align with nightlife, social gatherings, and alcohol-related activity. Narcotics exhibits bimodal patterns (two distinct peaks), this suggests multiple underlying situational drivers across the day. These patterns indicate that crime timing is not homogeneous across categories. Instead, each offense type has its own temporal structure.
+
+According to the plot, it looks as though less crime is reported from around midnight to the morning. This may suggest that less crime happens throughout the night (that is, “crime sleeps”), or perhaps there are less officers patrolling throughout the night, businesses are closed, or less surveillance visibility.
+
+{{< pagebreak >}}
+
+```{r, echo=FALSE, message=FALSE, warning=FALSE, fig.width=9, fig.height=7}
+library(DBI)
+library(RSQLite)
+library(ggplot2)
+library(ggalluvial)
+library(scales)
+library(knitr)
+library(ragg)
+
+dbExecute(con, "CREATE INDEX IF NOT EXISTS idx_crimes_primary_type ON crimes_clean([Primary Type])")
+dbExecute(con, "CREATE INDEX IF NOT EXISTS idx_crimes_location_desc ON crimes_clean([Location Description])")
+
+major_alluvial_data <- dbGetQuery(con, "
+WITH filtered AS (
+  SELECT
+    [Primary Type] AS Primary_Type,
+    [Location Description] AS Location_Desc,
+    CASE
+      WHEN Arrest IN (1, '1', 'TRUE', 'Y', 'Yes', TRUE) THEN 'Arrest: Yes'
+      ELSE 'Arrest: No'
+    END AS Arrest
+  FROM crimes_clean
+  WHERE [Primary Type] IN (
+      'THEFT', 'BATTERY', 'CRIMINAL DAMAGE', 'NARCOTICS',
+      'ASSAULT', 'MOTOR VEHICLE THEFT', 'BURGLARY'
+    )
+    AND [Location Description] IS NOT NULL
+),
+top_locations AS (
+  SELECT Location_Desc
+  FROM filtered
+  GROUP BY Location_Desc
+  ORDER BY COUNT(*) DESC
+  LIMIT 5
+)
+SELECT
+  f.Primary_Type,
+  f.Location_Desc,
+  CASE
+    WHEN f.Primary_Type IN ('BATTERY', 'ASSAULT') THEN 'VIOLENT'
+    WHEN f.Primary_Type IN ('CRIMINAL DAMAGE', 'MOTOR VEHICLE THEFT', 'BURGLARY', 'THEFT') THEN 'PROPERTY'
+    WHEN f.Primary_Type = 'NARCOTICS' THEN 'DRUG'
+    ELSE 'OTHER'
+  END AS Nature,
+  f.Arrest,
+  COUNT(*) AS Count
+FROM filtered f
+JOIN top_locations tl
+  ON f.Location_Desc = tl.Location_Desc
+GROUP BY
+  f.Primary_Type,
+  f.Location_Desc,
+  Nature,
+  f.Arrest
+ORDER BY Count DESC
+")
+
+major_alluvial_data$Arrest <- factor(major_alluvial_data$Arrest)
+major_alluvial_data$Nature <- factor(
+  major_alluvial_data$Nature,
+  levels = c('VIOLENT', 'PROPERTY', 'DRUG', 'OTHER')
+)
+
+options(scipen = 999)
+
+major_alluvial_plot <- ggplot(
+  major_alluvial_data,
+  aes(
+    axis1 = Primary_Type,
+    axis2 = Location_Desc,
+    axis3 = Nature,
+    axis4 = Arrest,
+    y = Count
+  )
+) +
+  geom_alluvium(aes(fill = Primary_Type), width = 1/11, alpha = 1) +
+  geom_stratum(width = 1/3, fill = "black", color = "pink") +
+  geom_label(
+    stat = "stratum",
+    aes(label = after_stat(stratum)),
+    size = 4,
+    label.size = 0.25
+  ) +
+  scale_x_continuous(
+    breaks = 1:4,
+    labels = c("Major Crime", "Location", "Nature", "Arrest")
+  ) +
+  scale_fill_viridis_d(option = "inferno", alpha = 1) +
+  labs(
+    title = "Alluvial Plot of Major Crimes in Chicago",
+    x = NULL,
+    y = NULL
+  ) +
+  theme_minimal(base_size = 14) +
+  theme(
+    legend.position = "bottom",
+    legend.text = element_text(size = 15),
+    legend.title = element_blank(),
+    legend.background = element_rect(color = "black", fill = NA),
+    plot.title = element_text(size = 24, face = "bold", hjust = 0.5),
+    axis.title.y = element_blank(),
+    axis.text.y = element_blank(),
+    axis.text.x = element_text(size = 15, face = "bold.italic"),
+    panel.background = element_blank(),
+    plot.background = element_rect(fill = "#2F4F4F", color = NA)
+  )
+
+major_alluvial_plot
+
+ggsave(
+  filename = "major_alluvial_plot.png",
+  plot = major_alluvial_plot,
+  device = ragg::agg_png,
+  width = 11, height = 8, units = "in", dpi = 300
+)
+```
+
+**Plot 7: Alluvial Plot**
+
+People generally believe that committing a crime will lead you to being arrested. It turns out, at least in Chicago, that a significant portion of crimes never result in an arrest, whether that be due to lack of sufficient evidence, lack of resources, too much bureaucracy, or corruption. This alluvial plot shows the relationship between the most committed crimes in Chicago (which each have over a hundred thousand instances over the 2001-2025 time period), the nature/classification of those crimes, the most common locations with criminal activity, and whether or not those crimes resulted in an arrest being made by Chicago PD. Narcotics, and by extension drug crimes, always result in arrests. They mostly occur outside (on the street or the sidewalk) instead of within residences or apartments. There isn’t any reason to believe that narcotic/drug crimes occur outside more frequently than inside; generally, people hold the notion that most drug use occurs within one’s own home. So, this trend could be indicative of the higher probability of being caught when performing a drug crime outdoors versus indoors. The vast majority of property crimes seem to not result in an arrest whilst more violent crimes do proportionally result in an arrest (although the majority of violent crimes also don’t result in arrests). Of the violent crimes that do result in an arrest, they are mostly battery charges. This may be because battery is the actual physical act of harming another whilst assault is merely the threat to do so. Of the property crimes that do result in an arrest, the split is roughly equal between criminal damage (vandalism) and motor vehicle theft. Future work that follows this model could look at more locations to build a stronger plot that could help to visualize whether certain locations have any impact on the type of crime that occurs there and whether or not arrests happen there.
+
+{{< pagebreak >}}
+
+```{r, message=FALSE}
+library(ggplot2)
+library(scales)
+
+district_counts <- dbGetQuery(con, "
+  SELECT
+    CAST(District AS INTEGER) AS District,
+    COUNT(*) AS count
+  FROM crimes_clean
+  WHERE District IS NOT NULL
+  GROUP BY CAST(District AS INTEGER)
+  ORDER BY count DESC
+")
+
+district_counts$District <- factor(district_counts$District,
+                                   levels = district_counts$District)
+
+ggplot(district_counts, aes(x = District, y = count)) +
+  geom_col(fill = "lightblue", color = "white") +
+  labs(
+    title = "Crimes by District",
+    x = "District",
+    y = "Number of Crimes"
+  ) +
+  scale_y_continuous(labels = comma) +
+  theme_minimal()
+
+#######
+library(DBI)
+library(readr)
+library(dplyr)
+
+master_raw <- read_csv("chicago_beat_data/master.csv", show_col_types = FALSE)
+dbWriteTable(con, "beat_population", master_raw, overwrite = TRUE)
+
+dbExecute(con, "DROP TABLE IF EXISTS district_population")
+
+dbExecute(con, "
+  CREATE TABLE district_population AS
+  SELECT
+    CAST(substr(beat, 1, 2) AS INTEGER) AS District,
+    SUM(population) AS district_population,
+    SUM(square_mileage) AS district_area,
+    SUM(households) AS district_households
+  FROM beat_population
+  WHERE beat IS NOT NULL
+    AND population IS NOT NULL
+  GROUP BY CAST(substr(beat, 1, 2) AS INTEGER)
+  ORDER BY District
+")
+
+district_pop <- dbGetQuery(con, "
+  SELECT * 
+  FROM district_population
+")
+
+district_counts <- dbGetQuery(con, "
+  SELECT
+    CAST(District AS INTEGER) AS District,
+    COUNT(*) AS count
+  FROM crimes_clean
+  WHERE District IS NOT NULL
+    AND CAST(District AS INTEGER) != 21
+    AND CAST(District AS INTEGER) != 31
+  GROUP BY CAST(District AS INTEGER)
+  ORDER BY count DESC
+")
+
+district_counts <- district_counts %>%
+  mutate(District = as.integer(District))
+
+district_pop <- district_pop %>%
+  mutate(District = as.integer(District))
+
+district_df <- district_counts %>%
+  left_join(district_pop, by = "District")
+
+district_df <- district_df %>%
+  mutate(
+    crimes_per_1000 = 1000 * count / district_population
+  )
+
+# per-capita plot
+ggplot(district_df, aes(x = factor(District), y = crimes_per_1000)) +
+  geom_col(fill = "lightblue", color = "white") +
+  labs(
+    title = "Crimes per 1,000 Residents by District",
+    x = "District",
+    y = "Crimes per 1,000 residents"
+  ) +
+  theme_minimal()
+
+# district population plot
+ggplot(district_df, aes(x = factor(District), y = district_population)) +
+  geom_col(fill = "lightblue", color = "white") +
+  labs(
+    title = "District Population",
+    x = "District",
+    y = "Population"
+  ) +
+  theme_minimal()
+```
+
+
+Figure 8: Police Districts Histograms
+
+Based on these plots, it is evident that police districts have a wide range of crime intensity. The first histogram shows the crime totals
+
+
+
+{{< pagebreak >}}
+
+```{r, echo=FALSE, message=FALSE, warning=FALSE, fig.width=8, fig.height=6}
+library(DBI)
+library(RSQLite)
+library(ggplot2)
+library(dplyr)
+library(scales)
+
+location_text_query <- "
+SELECT `Location.Description` AS location
+FROM crimes_clean
+WHERE `Location.Description` IS NOT NULL
+  AND TRIM(`Location.Description`) != ''
+"
+
+location_raw <- dbGetQuery(con, location_text_query)
+
+keywords <- c(
+  "STREET", "RESIDENCE", "APARTMENT", "SIDEWALK", "PARKING LOT",
+  "SCHOOL", "STORE", "ALLEY", "RESTAURANT", "PARK",
+  "GAS STATION", "BANK", "HOSPITAL", "VEHICLE", "BAR",
+  "OFFICE", "HOTEL", "CHURCH", "TRANSIT", "HIGHWAY"
+)
+
+keyword_counts <- sapply(keywords, function(kw) {
+  sum(grepl(kw, location_raw$location, ignore.case = TRUE))
+})
+
+location_keywords_df <- data.frame(
+  keyword = names(keyword_counts),
+  crime_count = as.integer(keyword_counts)
+) |>
+  arrange(desc(crime_count))
+
+location_keywords_df$keyword <- factor(
+  location_keywords_df$keyword,
+  levels = rev(location_keywords_df$keyword)
+)
+
+ggplot(location_keywords_df, aes(x = crime_count, y = keyword)) +
+  geom_col(fill = "#2C5F8A", width = 0.75) +
+  geom_text(
+    aes(label = comma(crime_count)),
+    hjust = -0.1,
+    size = 3,
+    color = "gray30"
+  ) +
+  scale_x_continuous(
+    labels = comma,
+    expand = expansion(mult = c(0, 0.18))
+  ) +
+  labs(
+    title = "Most Common Crime Location Types in Chicago",
+    subtitle = "Keyword frequency extracted from Location Description field | 2001-Present",
+    x = "Number of Incidents Containing Keyword",
+    y = NULL,
+    caption = "Text mining applied to Location Description via \n keyword matching in R after SQL extraction."
+  ) +
+  theme_minimal(base_size = 12) +
+  theme(
+    plot.title = element_text(face = "bold", size = 14),
+    plot.subtitle = element_text(color = "gray50", size = 10),
+    panel.grid.major.y = element_blank(),
+    panel.grid.minor = element_blank(),
+    axis.text.y = element_text(size = 10)
+  )
+```
+
+Plot 9
+
+The bar chart displays the frequency of key location-type keywords extracted from the Location Description field of the Chicago crimes dataset, spanning from 2001 to the present. A text mining approach was applied by scanning every entry for general place-type keywords such as "street," "residence," "apartment," "sidewalk," and others, allowing granular and varied descriptions to be rolled up into broader, more interpretable categories.
+
+The results reveal that streets and residences are by far the most common settings for reported crimes in Chicago, suggesting that a significant portion of criminal activity occurs either in open public spaces or within or immediately around private homes. Sidewalks and parking lots also rank highly, reinforcing the pattern that outdoor and semi-public spaces represent elevated risk environments. More enclosed or specialized locations such as banks, hospitals, and churches appear far less frequently, which may reflect both lower foot traffic in those settings and stronger security deterrents. Schools, parks, and gas stations fall in the middle range, indicating moderate but consistent criminal activity in those areas. Taken together, these findings suggest that crime prevention efforts in Chicago may be most impactful when concentrated on street-level and residential environments, as these locations account for the overwhelming majority of reported incidents.
+
+{{< pagebreak >}}
+
+```{r}
+library(DBI)
+library(dplyr)
+library(ggplot2)
+library(scales)
+library(broom)
+library(knitr)
+library(splines)
+library(riem)
+library(lubridate)
+library(tibble)
+library(zoo)
+library(tidyr)
+library(stringr)
+library(kableExtra)
+crime_recent <- dbGetQuery(con, "
+WITH base AS (
+  SELECT
+    CAST(substr(Date, 7, 4) AS INTEGER) AS Year,
+    CASE
+      WHEN Arrest IN (1, '1', 'TRUE', 'Y', 'Yes', TRUE) THEN 1
+      ELSE 0
+    END AS Arrest01,
+    CAST(Domestic AS TEXT) AS Domestic,
+    [Primary Type] AS Primary_Type,
+    Date,
+    CASE
+      WHEN substr(Date, 21, 2) = 'AM' AND substr(Date, 12, 2) = '12' THEN 0
+      WHEN substr(Date, 21, 2) = 'AM' THEN CAST(substr(Date, 12, 2) AS INTEGER)
+      WHEN substr(Date, 21, 2) = 'PM' AND substr(Date, 12, 2) = '12' THEN 12
+      ELSE CAST(substr(Date, 12, 2) AS INTEGER) + 12
+    END AS Hour
+  FROM crimes_clean
+  WHERE Date IS NOT NULL
+    AND [Primary Type] IS NOT NULL
+    AND Domestic IS NOT NULL
+    AND Arrest IS NOT NULL
+),
+top_types AS (
+  SELECT Primary_Type
+  FROM base
+  WHERE Year >= 2015
+  GROUP BY Primary_Type
+  ORDER BY COUNT(*) DESC
+  LIMIT 10
+)
+SELECT
+  b.Year,
+  b.Arrest01,
+  b.Domestic,
+  b.Primary_Type,
+  b.Hour
+FROM base b
+JOIN top_types t
+  ON b.Primary_Type = t.Primary_Type
+WHERE b.Year >= 2015
+")
+
+crime_recent <- crime_recent %>%
+  mutate(
+    Domestic = factor(Domestic),
+    Primary_Type = droplevels(factor(Primary_Type)),
+    Year = as.integer(Year),
+    Hour = as.integer(Hour),
+    Arrest01 = as.integer(Arrest01)
+  )
+
+crime_lm <- lm(Arrest01 ~ Hour + Year + Domestic * Primary_Type, data = crime_recent)
+
+lm_sum <- summary(crime_lm)
+
+adj_r2 <- lm_sum$adj.r.squared
+f_stat <- lm_sum$fstatistic
+f_value <- unname(f_stat["value"])
+df1 <- unname(f_stat["numdf"])
+df2 <- unname(f_stat["dendf"])
+p_value <- pf(f_value, df1, df2, lower.tail = FALSE)
+
+format_p_sci <- function(x) {
+  ifelse(x < 0.001, format(x, scientific = TRUE, digits = 2), sprintf("%.4f", x))
+}
+
+fit_table <- tibble(
+  Metric = c(
+    "Adjusted R-squared",
+    "F-statistic",
+    "Numerator df",
+    "Denominator df",
+    "Model p-value"
+  ),
+  Value = c(
+    round(adj_r2, 4),
+    round(f_value, 2),
+    df1,
+    df2,
+    format_p_sci(p_value)
+  )
+)
+
+kable(
+  fit_table,
+  caption = "Linear Probability Model Fit Statistics for Arrest"
+)
+
+coef_table <- tidy(crime_lm, conf.int = TRUE) %>%
+  mutate(
+    term = recode(
+      term,
+      `(Intercept)` = "Intercept",
+      `Hour` = "Hour of day",
+      `Year` = "Year",
+      `DomesticTRUE` = "Domestic incident",
+      `Domestic1` = "Domestic incident",
+      .default = term
+    ),
+    term = str_replace_all(term, "Primary_Type", "Crime type: "),
+    term = str_replace_all(term, "DomesticTRUE:", "Domestic incident × "),
+    term = str_replace_all(term, "Domestic1:", "Domestic incident × "),
+    term = str_replace_all(term, ":", " × "),
+    estimate  = round(estimate, 4),
+    std.error = round(std.error, 4),
+    statistic = round(statistic, 4),
+    p.value   = format_p_sci(p.value)
+  ) %>%
+  select(term, estimate, std.error, statistic, p.value)
+
+kable(
+  coef_table,
+  format = "latex",
+  booktabs = TRUE,
+  longtable = TRUE,
+  linesep = "",
+  caption = "Regression Coefficients for Arrest on Hour, Year, Domestic Incident, Crime Type, and Their Interaction",
+  col.names = c("Term", "Estimate", "Std. Error", "t-statistic", "p-value"),
+  align = c("p{7cm}", "r", "r", "r", "r")
+) %>%
+  kable_styling(
+    latex_options = c("repeat_header", "hold_position"),
+    font_size = 9
+  )
+```
+
+\begin{large}
+\textbf{Statistical Modeling: Regression}
+\end{large}
+
+Purpose of the Model:
+
+To understand which contextual and temporal factors significantly affect the probability that a crime results in an arrest.
+
+A linear probability model (LPM) was used instead of a logistic generalized linear model so that model fit could be summarized with an overall F-statistic and adjusted R\^2, as requested. In this approach, the response variable Arrest01 is coded as 0/1, and an ordinary least squares regression estimates how each predictor is associated with the predicted probability of arrest (interpretable in percentage-point changes). To reduce the number of categorical levels and improve interpretability, the analysis restricts Primary.Type to the top 10 most frequent crime types in the data since 2015, while also including Domestic, Hour, and Year as predictors.
+
+Model results are reported in tables rather than console output. The fit-statistics table provides the adjusted R\^2 (how much variation in arrest outcomes is explained by the predictors after adjusting for model size) and the F-statistic with its p-value (testing whether the predictors jointly improve prediction compared to a null model). The coefficient table reports estimated effects and confidence intervals for each predictor. In this LPM, a positive coefficient indicates that the predictor is associated with a higher probability of arrest, while a negative coefficient indicates a lower probability of arrest, holding the other variables constant. For example, the coefficient on Domestic represents the difference in arrest probability between domestic and non-domestic incidents, and the coefficients on Hour and Year represent the change in arrest probability for a one-unit increase in hour or year.
+
+These associations should not be interpreted as causal. Arrest outcomes can be influenced by unobserved factors (presence of a suspect, reporting behavior, policing resources), and some predictors may be correlated with one another (certain crime types tend to occur at particular times of day). Additionally, because the model focuses on the most common crime types, the results describe arrest patterns for high-frequency categories rather than the full set of offenses. More advanced modeling (logistic regression with regularization, interaction terms, or neighborhood controls) could further clarify which factors are most predictive of arrest and how those relationships vary across contexts.
+
+```{r, fig.width = 8, fig.height = 10}
+library(DBI)
+library(RSQLite)
+library(dplyr)
+library(ggplot2)
+library(scales)
+library(tibble)
+library(ggrepel)
+
+finger_df <- dbGetQuery(con, "
+SELECT
+  CAST(District AS INTEGER) AS district_num,
+  printf('%04d', CAST(Beat AS INTEGER)) AS beat,
+  COUNT(*) AS crime_count
+FROM crimes_clean
+WHERE District IS NOT NULL
+  AND Beat IS NOT NULL
+  AND CAST(District AS INTEGER) = 11
+  AND substr(printf('%04d', CAST(Beat AS INTEGER)), 1, 2) = '11'
+GROUP BY CAST(District AS INTEGER), CAST(Beat AS INTEGER)
+") %>%
+  as_tibble() %>%
+  rename(crime_rate = crime_count) %>%
+  mutate(
+    district = paste("District", district_num),
+    beat = paste("Beat", beat)
+  )
+
+finger_df <- finger_df %>%
+  arrange(desc(crime_rate)) %>%
+  mutate(
+    beat = factor(beat, levels = beat)
+  )
+
+make_wavy_band <- function(theta_start, theta_end,
+                           r_outer, r_inner,
+                           wave_amp = 0.03,
+                           wave_freq = 5,
+                           phase = 0,
+                           n = 400) {
+  theta_top <- seq(theta_start, theta_end, length.out = n)
+  theta_bot <- rev(theta_top)
+
+  outer_offset <- wave_amp * sin(wave_freq * theta_top + phase) +
+    0.5 * wave_amp * sin((wave_freq + 2) * theta_top + 0.7 * phase)
+
+  inner_offset <- wave_amp * sin(wave_freq * theta_bot + phase) +
+    0.5 * wave_amp * sin((wave_freq + 2) * theta_bot + 0.7 * phase)
+
+  r_top <- r_outer + outer_offset
+  r_bot <- r_inner + inner_offset
+
+  tibble(
+    x = c(r_top * cos(theta_top), r_bot * cos(theta_bot)),
+    y = c(r_top * sin(theta_top), r_bot * sin(theta_bot))
+  )
+}
+
+build_fingerprint <- function(df,
+                              theta_min = 0,
+                              theta_max = 2 * pi,
+                              r0 = 0.6,
+                              band_gap = 0.04,
+                              band_width = 0.12) {
+  if (nrow(df) == 0) {
+    stop("No rows left after filtering.")
+  }
+
+  beat_levels <- levels(df$beat)
+
+  df <- df %>%
+    mutate(
+      beat = factor(beat, levels = beat_levels),
+      intensity = rescale(crime_rate, to = c(0.35, 1))
+    ) %>%
+    arrange(beat)
+
+  band_list <- list()
+
+  for (i in seq_along(beat_levels)) {
+    seg <- df %>% filter(beat == beat_levels[i])
+
+    r_outer <- r0 + (i - 1) * (band_width + band_gap)
+    r_inner <- r_outer - band_width
+
+    wave_amp_i <- 0.015 + 0.01 * (i %% 3)
+    wave_freq_i <- 4 + (i %% 4)
+    phase_i <- i * 0.45
+
+    poly <- make_wavy_band(
+      theta_start = theta_min,
+      theta_end   = theta_max,
+      r_outer = r_outer,
+      r_inner = r_inner,
+      wave_amp = wave_amp_i,
+      wave_freq = wave_freq_i,
+      phase = phase_i,
+      n = 500
+    )
+
+    poly$beat <- as.character(seg$beat)
+    poly$crime_rate <- seg$crime_rate
+    poly$intensity <- seg$intensity
+    poly$group_id <- paste0("ridge", i)
+
+    band_list[[i]] <- poly
+  }
+
+  bind_rows(band_list)
+}
+
+fp_plot_data <- build_fingerprint(finger_df)
+
+beat_labels <- finger_df %>%
+  arrange(beat) %>%
+  mutate(
+    ring_id = row_number(),
+    r_outer = 0.6 + (ring_id - 1) * (0.12 + 0.04),
+    theta_label = pi / 3,
+    x = (r_outer + 0.02) * cos(theta_label),
+    y = (r_outer + 0.02) * sin(theta_label)
+  )
+
+ggplot(
+  fp_plot_data,
+  aes(x = x, y = y, group = group_id, fill = crime_rate, alpha = intensity)
+) +
+  geom_polygon(color = "black", linewidth = 0.12) +
+  geom_label_repel(
+    data = beat_labels,
+    aes(x = x, y = y, label = beat),
+    inherit.aes = FALSE,
+    size = 3,
+    fontface = "bold",
+    direction = "y",
+    nudge_x = 1.2,
+    box.padding = 0.25,
+    point.padding = 0.1,
+    label.size = 0.15,
+    segment.color = "grey30",
+    segment.size = 0.3,
+    fill = alpha("white", 0.8),
+    seed = 123,
+    max.overlaps = Inf
+  ) +
+  coord_equal() +
+  scale_alpha(range = c(0.35, 1), guide = "none") +
+  scale_fill_viridis_c(name = "Crime count") +
+  labs(
+    title = "District 11 Crime Fingerprint",
+    subtitle = "Each ridge = one beat"
+  ) +
+  theme_void() +
+  theme(
+    plot.title = element_text(face = "bold", hjust = 0.5),
+    plot.subtitle = element_text(hjust = 0.5),
+    legend.position = "right"
+  )
+```
+
+
+
+```{r, fig.width = 8, fig.height = 9}
+library(DBI)
+library(RSQLite)
+library(dplyr)
+library(ggplot2)
+library(scales)
+library(tibble)
+library(ggrepel)
+library(forcats)
+
+# --------------------------------
+# Pull beat-level crime metrics
+# --------------------------------
+finger_df <- dbGetQuery(con, "
+WITH yearly AS (
+  SELECT
+    CAST(District AS INTEGER) AS district_num,
+    printf('%04d', CAST(Beat AS INTEGER)) AS beat,
+    CAST(substr(Date, 7, 4) AS INTEGER) AS year,
+    COUNT(*) AS yearly_crime
+  FROM crimes_clean
+  WHERE District IS NOT NULL
+    AND Beat IS NOT NULL
+    AND Date IS NOT NULL
+    AND CAST(District AS INTEGER) = 11
+    AND substr(printf('%04d', CAST(Beat AS INTEGER)), 1, 2) = '11'
+    AND CAST(substr(Date, 7, 4) AS INTEGER) BETWEEN 2020 AND 2025
+  GROUP BY CAST(District AS INTEGER),
+           printf('%04d', CAST(Beat AS INTEGER)),
+           CAST(substr(Date, 7, 4) AS INTEGER)
+),
+volatility AS (
+  SELECT
+    district_num,
+    beat,
+    AVG(yearly_crime) AS mean_yearly_crime,
+    CASE
+      WHEN AVG(yearly_crime) = 0 THEN 0
+      ELSE sqrt(AVG(yearly_crime * yearly_crime) - AVG(yearly_crime) * AVG(yearly_crime)) / AVG(yearly_crime)
+    END AS crime_cv
+  FROM yearly
+  GROUP BY district_num, beat
+),
+totals AS (
+  SELECT
+    CAST(District AS INTEGER) AS district_num,
+    printf('%04d', CAST(Beat AS INTEGER)) AS beat,
+    COUNT(*) AS total_crime,
+    SUM(CASE
+          WHEN [Primary Type] IN (
+            'HOMICIDE',
+            'ROBBERY',
+            'ASSAULT',
+            'BATTERY',
+            'CRIM SEXUAL ASSAULT',
+            'KIDNAPPING'
+          ) THEN 1 ELSE 0
+        END) AS violent_crime,
+    SUM(CASE
+          WHEN Arrest = 1 OR Arrest = 'TRUE' OR Arrest = 'true' THEN 1 ELSE 0
+        END) AS arrests
+  FROM crimes_clean
+  WHERE District IS NOT NULL
+    AND Beat IS NOT NULL
+    AND CAST(District AS INTEGER) = 11
+    AND substr(printf('%04d', CAST(Beat AS INTEGER)), 1, 2) = '11'
+  GROUP BY CAST(District AS INTEGER), printf('%04d', CAST(Beat AS INTEGER))
+),
+beat_geo AS (
+  SELECT
+    printf('%04d', CAST(Beat AS INTEGER)) AS beat,
+    AVG(Longitude) AS lon,
+    AVG(Latitude) AS lat
+  FROM crimes_clean
+  WHERE District IS NOT NULL
+    AND Beat IS NOT NULL
+    AND Latitude IS NOT NULL
+    AND Longitude IS NOT NULL
+    AND CAST(District AS INTEGER) = 11
+    AND substr(printf('%04d', CAST(Beat AS INTEGER)), 1, 2) = '11'
+  GROUP BY printf('%04d', CAST(Beat AS INTEGER))
+)
+SELECT
+  t.district_num,
+  t.beat,
+  t.total_crime,
+  t.violent_crime,
+  t.arrests,
+  v.mean_yearly_crime,
+  v.crime_cv,
+  g.lon,
+  g.lat
+FROM totals t
+LEFT JOIN volatility v
+  ON t.district_num = v.district_num
+ AND t.beat = v.beat
+LEFT JOIN beat_geo g
+  ON t.beat = g.beat
+") %>%
+  as_tibble() %>%
+  mutate(
+    violent_rate = violent_crime / total_crime,
+    arrest_rate  = arrests / total_crime,
+    district     = paste("District", district_num),
+    beat_label   = paste("Beat", beat)
+  )
+
+# --------------------------------
+# Prepare beat aesthetics
+# Highest crime = inner ridges
+# Geography = controlled deformation
+# --------------------------------
+finger_df2 <- finger_df %>%
+  arrange(desc(total_crime)) %>%
+  mutate(
+    beat = factor(beat_label, levels = beat_label),
+    crime_scaled = rescale(total_crime, to = c(0, 1)),
+    wave_amp     = rescale(total_crime, to = c(0.0008, 0.0035)),
+    ridge_width  = rescale(violent_rate, to = c(0.5, 5)),
+    ridge_alpha  = rescale(arrest_rate, to = c(0.40, 1.0)),
+    crime_cv     = ifelse(is.na(crime_cv), median(crime_cv, na.rm = TRUE), crime_cv),
+    n_breaks     = pmax(0, pmin(2, round(rescale(crime_cv, to = c(0, 2))))),
+    break_width  = rescale(crime_cv, to = c(0.015, 0.04))
+  ) %>%
+  mutate(
+    lon_c = lon - mean(lon, na.rm = TRUE),
+    lat_c = lat - mean(lat, na.rm = TRUE),
+    dist_c = sqrt(lon_c^2 + lat_c^2),
+    theta_geo = atan2(lat_c, lon_c),
+    x_shift = rescale(lon_c, to = c(-0.10, 0.10)),
+    y_shift = rescale(lat_c, to = c(-0.10, 0.10)),
+    bulge   = rescale(dist_c, to = c(0.00, 0.14)),
+    geo_phase = theta_geo
+  )
+
+# --------------------------------
+# Loop ridge generator
+# Higher-crime inner ridges curl more
+# Geography adds subtle alluvial-like drift
+# --------------------------------
+make_loop_ridge <- function(
+  s,
+  innerness,
+  x_shift = 0,
+  y_shift = 0,
+  bulge = 0,
+  geo_phase = 0,
+  n = 900,
+  side = "right",
+  wave_amp = 0.002,
+  phase = 0
+) {
+  t <- seq(-pi, pi, length.out = n)
+  side_sign <- ifelse(side == "right", 1, -1)
+
+  a <- 1.05 + 0.55 * abs(s)
+  b <- 1.85 + 0.25 * abs(s)
+
+  x0 <- a * cos(t)
+  y0 <- b * sin(t)
+
+  core_pull  <- (0.85 + 0.85 * innerness) * exp(-((t - side_sign * 0.08)^2) / 0.10)
+  inner_hook <- (0.18 + 0.75 * innerness) * exp(-((t - side_sign * 0.34)^2) / 0.05)
+  delta_pull <- (0.22 + 0.15 * (1 - innerness)) * exp(-((t + side_sign * 1.48)^2) / 0.13)
+
+  x <- x0 -
+    side_sign * core_pull * (1 - abs(s) / 1.25) -
+    side_sign * inner_hook * (1 - abs(s) / 1.05) +
+    side_sign * 0.10 * delta_pull
+
+  y <- y0
+  y <- y - 0.26 * exp(-((t + side_sign * 1.52)^2) / 0.16)
+
+  # crime intensity driven waviness
+  x <- x + wave_amp * sin((12 + 4 * innerness) * t + phase) +
+    0.30 * wave_amp * sin((24 + 3 * innerness) * t + 0.7 * phase)
+  y <- y + 0.35 * wave_amp * cos((11 + 3 * innerness) * t + 0.5 * phase)
+
+  # geography-driven deformation
+  geo_pull <- bulge * exp(-((t - geo_phase)^2) / 0.18)
+  x <- x + x_shift + 0.35 * geo_pull * cos(t) + 0.08 * x_shift * sin(2 * t)
+  y <- y + y_shift + 0.55 * geo_pull * sin(t) + 0.06 * y_shift * cos(3 * t)
+
+  # final aspect / slant
+  y <- 1.30 * y
+  x <- 0.90 * x + 0.08 * y
+
+  tibble(x = x, y = y, t = t)
+}
+
+# --------------------------------
+# Add subtle breaks = volatility
+# --------------------------------
+add_loop_breaks <- function(df, i, n_breaks = 1, break_width = 0.03) {
+  if (n_breaks <= 0) return(df)
+
+  t_min <- min(df$t, na.rm = TRUE)
+  t_max <- max(df$t, na.rm = TRUE)
+
+  centers <- seq(t_min + 0.55, t_max - 0.55, length.out = n_breaks + 2)
+  centers <- centers[2:(length(centers) - 1)] + (i %% 3 - 1) * 0.05
+
+  keep <- rep(TRUE, nrow(df))
+  for (cc in centers) {
+    keep <- keep & !(df$t > (cc - break_width / 2) & df$t < (cc + break_width / 2))
+  }
+
+  out <- df
+  out[!keep, c("x", "y")] <- NA
+  out
+}
+
+build_loop_fingerprint <- function(df, side = "right") {
+  beat_levels <- levels(df$beat)
+  s_vals <- seq(0.002, 1.18, length.out = length(beat_levels))
+
+  ridge_list <- list()
+
+  for (i in seq_along(beat_levels)) {
+    seg <- df %>% filter(beat == beat_levels[i])
+
+    innerness <- 1 - rescale(
+      abs(s_vals[i]),
+      to = c(0, 1),
+      from = c(min(abs(s_vals)), max(abs(s_vals)))
+    )
+
+    ridge <- make_loop_ridge(
+      s = s_vals[i],
+      innerness = innerness,
+      side = side,
+      wave_amp = seg$wave_amp[1],
+      phase = i * 0.42,
+      x_shift = seg$x_shift[1],
+      y_shift = seg$y_shift[1],
+      bulge = seg$bulge[1],
+      geo_phase = seg$geo_phase[1]
+    )
+
+    ridge <- add_loop_breaks(
+      ridge,
+      i = i,
+      n_breaks = seg$n_breaks[1],
+      break_width = seg$break_width[1]
+    )
+
+    ridge$beat <- as.character(seg$beat[1])
+    ridge$total_crime  <- seg$total_crime[1]
+    ridge$violent_rate <- seg$violent_rate[1]
+    ridge$arrest_rate  <- seg$arrest_rate[1]
+    ridge$crime_cv     <- seg$crime_cv[1]
+    ridge$ridge_alpha  <- seg$ridge_alpha[1]
+    ridge$ridge_width  <- seg$ridge_width[1]
+    ridge$group_id     <- paste0("ridge", i)
+
+    ridge_list[[length(ridge_list) + 1]] <- ridge
+  }
+
+  # add extra inner core ridges using top crime beats
+  core_segs <- df %>% slice_head(n = 3)
+  core_s <- c(0.0008, 0.0016, 0.003)
+
+  for (j in seq_along(core_s)) {
+    seg <- core_segs[j, ]
+
+    ridge <- make_loop_ridge(
+      s = core_s[j],
+      innerness = 1,
+      side = side,
+      wave_amp = seg$wave_amp * 0.8,
+      phase = 10 + j,
+      x_shift = seg$x_shift * 0.4,
+      y_shift = seg$y_shift * 0.4,
+      bulge = seg$bulge * 0.4,
+      geo_phase = seg$geo_phase
+    )
+
+    ridge$beat <- as.character(seg$beat)
+    ridge$total_crime  <- seg$total_crime
+    ridge$violent_rate <- seg$violent_rate
+    ridge$arrest_rate  <- seg$arrest_rate
+    ridge$crime_cv     <- seg$crime_cv
+    ridge$ridge_alpha  <- seg$ridge_alpha
+    ridge$ridge_width  <- max(0.8, seg$ridge_width * 0.8)
+    ridge$group_id     <- paste0("core_ridge", j)
+
+    ridge_list[[length(ridge_list) + 1]] <- ridge
+  }
+
+  bind_rows(ridge_list)
+}
+
+fp_loop_data <- build_loop_fingerprint(finger_df2, side = "right")
+
+# --------------------------------
+# Label top 6 highest-crime beats
+# --------------------------------
+beat_labels <- finger_df2 %>%
+  slice_head(n = 6) %>%
+  mutate(
+    x = 1.95,
+    y = seq(0.95, -0.2, length.out = n())
+  )
+
+# --------------------------------
+# Plot
+# --------------------------------
+ggplot(
+  fp_loop_data,
+  aes(
+    x = x, y = y, group = group_id,
+    color = total_crime,
+    alpha = ridge_alpha,
+    linewidth = ridge_width
+  )
+) +
+  geom_path(lineend = "round", linejoin = "round") +
+  geom_label_repel(
+    data = beat_labels,
+    aes(x = x, y = y, label = beat),
+    inherit.aes = FALSE,
+    size = 3,
+    fontface = "bold",
+    box.padding = 0.22,
+    point.padding = 0.10,
+    label.size = 0.15,
+    segment.color = "grey35",
+    segment.size = 0.3,
+    fill = alpha("white", 0.85),
+    seed = 123,
+    max.overlaps = Inf,
+    direction = "y"
+  ) +
+  coord_equal(xlim = c(-1.85, 2.25), ylim = c(-2.35, 2.35), clip = "off") +
+  scale_linewidth(range = c(0.7, 2.2), guide = "none") +
+  scale_alpha(range = c(0.40, 1.0), guide = "none") +
+  scale_color_viridis_c(name = "Total crime") +
+  labs(
+    title = "District 11 Crime Loop Fingerprint",
+    subtitle = "Inner ridges = highest crime; spatial drift reflects beat location"
+  ) +
+  theme_void() +
+  theme(
+    plot.title = element_text(face = "bold", hjust = 0.5),
+    plot.subtitle = element_text(hjust = 0.5),
+    legend.position = "right",
+    plot.margin = margin(10, 45, 10, 10)
+  )
+```
+
+
+
+
+Killer Plot Idea: Fingerprint Graph
+  
+
