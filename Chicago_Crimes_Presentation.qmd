@@ -1,0 +1,712 @@
+---
+title: "Chicago Crime Patterns (2001–Present)"
+subtitle: "Group 8 (STAT 405)"
+author:
+  - "Preston Rusli"
+  - "Naidhruv Iyer"
+  - "Christopher White"
+date: "23 April 2026"
+format:
+  revealjs:
+    theme: simple
+    slide-number: true
+    incremental: true
+    embed-resources: true
+    smaller: true
+    fig-align: center
+    css: styles.css
+    footer: STAT 405 Final Project
+server: shiny
+editor: visual
+execute:
+  echo: false
+  message: false
+  warning: false
+---
+
+```{r}
+#| label: setup
+#| include: false
+set.seed(405)
+library(leaflet)
+library(htmltools)
+library(scales)
+library(stringr)
+library(DBI)
+library(RSQLite)
+library(readr)
+library(sf)
+library(dplyr)
+library(tidyr)
+library(ggplot2)
+library(DBI)
+library(RSQLite)
+library(tibble)
+library(ggrepel)
+library(forcats)
+
+con <- dbConnect(SQLite(), "chicago_crime.sqlite")
+
+#load crime data
+crime_raw <- read_csv("chicago_crime.csv", show_col_types = FALSE)
+dbWriteTable(con, "crimes", crime_raw, overwrite = TRUE)
+
+#load community area population
+pop_raw <- read_csv("acs_community_area_population.csv", show_col_types = FALSE)
+dbWriteTable(con, "population", pop_raw, overwrite = TRUE)
+
+# create indexes
+invisible(dbExecute(con, "CREATE INDEX IF NOT EXISTS idx_crimes_date ON crimes(Date)"))
+invisible(dbExecute(con, "CREATE INDEX IF NOT EXISTS idx_crimes_primary_type ON crimes([Primary Type])"))
+invisible(dbExecute(con, "CREATE INDEX IF NOT EXISTS idx_crimes_community_area ON crimes([Community Area])"))
+invisible(dbExecute(con, "CREATE INDEX IF NOT EXISTS idx_crimes_arrest ON crimes(Arrest)"))
+
+invisible(dbExecute(con, "DROP TABLE IF EXISTS crimes_clean"))
+invisible(dbExecute(con, "
+  CREATE TABLE crimes_clean AS
+  SELECT *
+  FROM crimes
+  WHERE Date IS NOT NULL
+    AND Year BETWEEN 2001 AND 2025
+    AND [Primary Type] IS NOT NULL
+    AND [Primary Type] != ''
+"))
+
+crime_counts <- dbGetQuery(con, "
+  SELECT
+    [Primary Type],
+    COUNT(*) AS crime_count
+  FROM crimes_clean
+  GROUP BY [Primary Type]
+  ORDER BY crime_count DESC
+")
+
+main_crimes <- dbGetQuery(con, "
+SELECT
+  CASE
+    WHEN [Primary Type] IN (
+      'THEFT', 'BURGLARY', 'MOTOR VEHICLE THEFT',
+      'CRIMINAL DAMAGE', 'CRIMINAL TRESPASS', 'ARSON'
+    ) THEN 'Theft / Property'
+
+    WHEN [Primary Type] IN (
+      'DECEPTIVE PRACTICE', 'OTHER OFFENSE', 'NON-CRIMINAL'
+    ) THEN 'Fraud / Administrative'
+
+    WHEN [Primary Type] IN (
+      'BATTERY', 'ASSAULT', 'HOMICIDE',
+      'KIDNAPPING', 'INTIMIDATION', 'STALKING'
+    ) THEN 'Violent Personal Crime'
+
+    WHEN [Primary Type] = 'ROBBERY'
+      THEN 'Robbery'
+
+    WHEN [Primary Type] IN (
+      'NARCOTICS', 'OTHER NARCOTIC VIOLATION'
+    ) THEN 'Drug Offenses'
+
+    WHEN [Primary Type] IN (
+      'WEAPONS VIOLATION', 'CONCEALED CARRY LICENSE VIOLATION',
+      'INTERFERENCE WITH PUBLIC OFFICER'
+    ) THEN 'Weapons / Law Enforcement'
+
+    WHEN [Primary Type] IN (
+      'SEX OFFENSE', 'CRIM SEXUAL ASSAULT', 'CRIMINAL SEXUAL ASSAULT',
+      'PROSTITUTION', 'OFFENSE INVOLVING CHILDREN',
+      'HUMAN TRAFFICKING', 'PUBLIC INDECENCY', 'OBSCENITY'
+    ) THEN 'Sexual / Exploitation Offenses'
+
+    WHEN [Primary Type] IN (
+      'PUBLIC PEACE VIOLATION', 'LIQUOR LAW VIOLATION',
+      'GAMBLING', 'RITUALISM', 'DOMESTIC VIOLENCE'
+    ) THEN 'Public Order / Vice'
+  END AS Crime_Group,
+  COUNT(*) AS crime_count
+FROM crimes_clean
+WHERE [Primary Type] IS NOT NULL
+GROUP BY Crime_Group
+ORDER BY crime_count DESC;")
+```
+
+## Title Slide
+
+## Introduction
+
+-   project motivation
+-   main questions
+-   data source
+
+## Variables and preprocessing
+
+-   key variables
+-   cleaning steps
+
+## Weekly Crime Trend
+
+```{r, echo=FALSE, warning=FALSE, message=FALSE, fig.align='center'}
+#| fig-width: 8
+#| fig-height: 6
+crime_weekly <- dbGetQuery(con, "
+  SELECT
+    date(
+      date(
+        substr(Date, 7, 4) || '-' ||
+        substr(Date, 1, 2) || '-' ||
+        substr(Date, 4, 2)
+      ),
+      '-' || ((strftime('%w',
+        date(
+          substr(Date, 7, 4) || '-' ||
+          substr(Date, 1, 2) || '-' ||
+          substr(Date, 4, 2)
+        )
+      ) + 6) % 7) || ' days'
+    ) AS week,
+    COUNT(*) AS count
+  FROM crimes_clean
+  WHERE Date IS NOT NULL
+    AND CAST(substr(Date, 7, 4) AS INTEGER) BETWEEN 2001 AND 2025
+  GROUP BY week
+  ORDER BY week
+")
+
+crime_weekly <- crime_weekly %>%
+  mutate(
+    week = as.Date(week),
+    count = as.numeric(count)
+  )
+
+ggplot(crime_weekly, aes(x = week, y = count)) +
+  geom_line(
+    aes(color = "Weekly totals"),
+    linewidth = 0.35,
+    alpha = 0.4
+  ) +
+  geom_smooth(
+    aes(color = "LOESS trend"),
+    method = "loess",
+    se = FALSE,
+    span = 0.25,
+    linewidth = 0.8
+  ) +
+  geom_vline(
+    xintercept = as.Date("2020-03-01"),
+    linetype = "dashed",
+    linewidth = 0.5,
+    alpha = 0.7
+  ) +
+  annotate(
+    "text",
+    x = as.Date("2020-03-01"),
+    y = Inf,
+    label = "COVID-19 (Mar 2020)",
+    vjust = 1.5,
+    hjust = -0.05,
+    size = 3
+  ) +
+  scale_x_date(
+    breaks = seq(
+      min(crime_weekly$week, na.rm = TRUE),
+      max(crime_weekly$week, na.rm = TRUE),
+      by = "2 years"
+    ),
+    labels = date_format("%Y"),
+    expand = c(0, 0)
+  ) +
+  scale_y_continuous(
+    limits = c(0, NA),
+    labels = comma
+  ) +
+  scale_color_manual(
+    name = NULL,
+    values = c(
+      "Weekly totals" = "gray25",
+      "LOESS trend" = "blue"
+    )
+  ) +
+  guides(color = guide_legend(override.aes = list(alpha = 1, linewidth = 1))) +
+  labs(
+    title = "Weekly Crimes with Smoothed Trend",
+    x = "Year",
+    y = "Number of reported crimes (weekly)"
+  ) +
+  theme_minimal(base_size = 13) +
+  theme(
+    panel.grid.minor = element_blank(),
+    legend.position = "top",
+    legend.justification = "center",
+    plot.title = element_text(face = "bold", hjust = 0.5)
+  )
+```
+
+-   Reported crime shows a strong long-run decline from the early 2000s into roughly the mid-2010s.
+-   There is a visible disruption around 2020–2021 near the COVID-19 marker.
+-   The repeating peaks and dips suggest a seasonal cycle on top of the long-run trend.
+-   Overall, Chicago crime levels appear shaped by both slow structural change and shorter-term shocks.
+
+## Crime by hour
+
+```{r, echo=FALSE, warning=FALSE, message=FALSE, fig.align='center'}
+#| fig-width: 8
+#| fig-height: 6
+hour_counts <- dbGetQuery(con, "
+  SELECT
+    CASE
+      WHEN substr(Date, 21, 2) = 'AM' AND substr(Date, 12, 2) = '12' THEN 0
+      WHEN substr(Date, 21, 2) = 'AM' THEN CAST(substr(Date, 12, 2) AS INTEGER)
+      WHEN substr(Date, 21, 2) = 'PM' AND substr(Date, 12, 2) = '12' THEN 12
+      ELSE CAST(substr(Date, 12, 2) AS INTEGER) + 12
+    END AS Hour,
+    COUNT(*) AS crime_count
+  FROM crimes_clean
+  WHERE Date IS NOT NULL
+    AND CAST(substr(Date, 7, 4) AS INTEGER) BETWEEN 2001 AND 2025
+  GROUP BY Hour
+  ORDER BY Hour
+")
+
+hour_labels <- c(
+  "12AM","1AM","2AM","3AM","4AM","5AM","6AM","7AM","8AM","9AM","10AM","11AM",
+  "12PM","1PM","2PM","3PM","4PM","5PM","6PM","7PM","8PM","9PM","10PM","11PM"
+)
+
+hour_counts <- hour_counts %>%
+  filter(!Hour %in% c(0, 12)) %>%
+  mutate(HourLabel = factor(hour_labels[Hour + 1], levels = hour_labels))
+
+ggplot(hour_counts, aes(x = HourLabel, y = crime_count)) +
+  geom_col(fill = "lightblue", color = "white") +
+  scale_x_discrete(drop = FALSE) +
+  labs(
+    title = "Crime by Hour of Day",
+    x = "Time of Day",
+    y = "Number of Crimes"
+  ) +
+  scale_y_continuous(labels = comma) +
+  theme_minimal() +
+  theme(
+    axis.text.x = element_text(angle = 45, hjust = 1)
+  )
+```
+
+-   Reported crime is lowest in the early morning, especially around 4 AM to 6 AM, and rises steadily through the day.
+-   Crime activity peaks in the late afternoon and evening, especially around 3 PM and 6 PM to 9 PM, before declining again later at night.
+
+## Monthly heatmap
+
+\[plot\] - 2 takeaways
+
+## Community area crime map
+::: columns
+::: {.column width="60%"}
+
+```{r, echo=FALSE, warning=FALSE, message=FALSE, fig.align='center'}
+crime_by_area <- dbGetQuery(con, "
+  SELECT
+    CAST([Community Area] AS INTEGER) AS Community_Area,
+    COUNT(*) AS crime_total_2020_2024,
+    COUNT(*) / 5.0 AS crime_avg_per_year
+  FROM crimes_clean
+  WHERE Date IS NOT NULL
+    AND [Community Area] IS NOT NULL
+    AND CAST(substr(Date, 7, 4) AS INTEGER) BETWEEN 2020 AND 2024
+  GROUP BY CAST([Community Area] AS INTEGER)
+  ORDER BY Community_Area
+")
+
+areas <- st_read("Boundaries_-_Community_Areas.geojson", quiet = TRUE) %>%
+  mutate(
+    Community_Area = as.integer(area_numbe),
+    comm_name = str_to_upper(str_squish(community))
+  )
+
+pop <- read_csv("acs_community_area_population.csv", show_col_types = FALSE) %>%
+  transmute(
+    comm_name = str_to_upper(str_squish(`Community Area`)),
+    population = as.numeric(`Total Population`)
+  )
+
+map_df <- areas %>%
+  left_join(crime_by_area, by = "Community_Area") %>%
+  left_join(pop, by = "comm_name") %>%
+  mutate(
+    crime_avg_per_year = replace_na(crime_avg_per_year, 0),
+    crimes_per_1000_per_year = if_else(
+      !is.na(population) & population > 0,
+      1000 * crime_avg_per_year / population,
+      NA_real_
+    )
+  ) %>%
+  st_make_valid() %>%
+  st_transform(4326)
+
+label_text <- paste0(
+  "<strong>", str_to_title(map_df$comm_name), "</strong><br>",
+  "Crimes per 1,000 residents: ",
+  round(map_df$crimes_per_1000_per_year, 1), "<br>",
+  "Average annual crimes: ",
+  round(map_df$crime_avg_per_year, 1), "<br>",
+  "Population: ",
+  comma(map_df$population)
+)
+
+pal <- colorNumeric(
+  palette = rev(viridisLite::plasma(256)),
+  domain = map_df$crimes_per_1000_per_year,
+  na.color = "#d9d9d9"
+)
+
+leaflet(data = map_df) %>%
+  addTiles() %>%
+  addPolygons(
+    fillColor = ~pal(crimes_per_1000_per_year),
+    weight = 1,
+    color = "white",
+    opacity = 1,
+    fillOpacity = 0.85,
+    smoothFactor = 0.2,
+    label = lapply(label_text, HTML),
+    highlightOptions = highlightOptions(
+      weight = 2,
+      color = "#333",
+      bringToFront = TRUE
+    )
+  ) %>%
+  addLegend(
+    pal = pal,
+    values = ~crimes_per_1000_per_year,
+    opacity = 0.85,
+    title = "Crimes per 1,000 residents",
+    position = "bottomright"
+  ) %>%
+  fitBounds(-87.95, 41.60, -87.50, 42.05)
+```
+:::
+::: {.column width="40%"}
+- Per-capita crime rates give a fairer comparison than raw counts because they account for large differences in community area population.
+-   Crime rates vary substantially across Chicago, with a few community areas standing out as concentrated high-rate hotspots rather than crime being evenly distributed.
+-   These patterns are descriptive, not causal, since factors like density, transit activity, nightlife, reporting behavior, and policing practices can all affect recorded rates.
+:::
+:::
+
+## Text Mining Bar Chart
+
+## Arrest model
+
+\[plot\] - key interpretation
+
+## Killer Plot
+
+::: columns
+::: {.column width="25%"}
+```{r}
+sliderInput("year", "Year:", min = 2020, max = 2025, value = 2025, step = 1, sep = "")
+```
+:::
+::: {.column width="75%"}
+```{r}
+plotOutput("fp_plot", height = "700px")
+```
+:::
+:::
+
+```{r}
+#| context: setup
+# fingerprint for each year setup ##### 
+yearly_finger <- dbGetQuery(con, "
+WITH year_counts AS (
+  SELECT
+    CAST(District AS INTEGER) AS district_num,
+    printf('%04d', CAST(Beat AS INTEGER)) AS beat,
+    CAST(substr(Date, 7, 4) AS INTEGER) AS year,
+    COUNT(*) AS total_crime,
+    SUM(CASE
+          WHEN [Primary Type] IN (
+            'HOMICIDE', 'ROBBERY', 'ASSAULT',
+            'BATTERY', 'CRIM SEXUAL ASSAULT', 'KIDNAPPING'
+          ) THEN 1 ELSE 0
+        END) AS violent_crime,
+    SUM(CASE
+          WHEN Arrest = 1 OR Arrest = 'TRUE' OR Arrest = 'true' THEN 1 ELSE 0
+        END) AS arrests,
+    AVG(Longitude) AS lon,
+    AVG(Latitude) AS lat
+  FROM crimes_clean
+  WHERE District IS NOT NULL
+    AND Beat IS NOT NULL
+    AND Latitude IS NOT NULL
+    AND Longitude IS NOT NULL
+    AND CAST(District AS INTEGER) IN (1,6,7,9,11,15)
+    AND CAST(substr(Date, 7, 4) AS INTEGER) BETWEEN 2020 AND 2025
+  GROUP BY CAST(District AS INTEGER), printf('%04d', CAST(Beat AS INTEGER)), CAST(substr(Date, 7, 4) AS INTEGER)
+),
+volatility AS (
+  SELECT
+    district_num,
+    beat,
+    AVG(total_crime) AS mean_yearly_crime,
+    CASE
+      WHEN AVG(total_crime) = 0 THEN 0
+      ELSE sqrt(AVG(total_crime * total_crime) - AVG(total_crime) * AVG(total_crime)) / AVG(total_crime)
+    END AS crime_cv
+  FROM year_counts
+  GROUP BY district_num, beat
+)
+SELECT
+  y.year,
+  y.district_num,
+  y.beat,
+  y.total_crime,
+  y.violent_crime,
+  y.arrests,
+  y.lon,
+  y.lat,
+  v.mean_yearly_crime,
+  v.crime_cv
+FROM year_counts y
+LEFT JOIN volatility v
+  ON y.district_num = v.district_num
+ AND y.beat = v.beat
+") %>%
+  as_tibble() %>%
+  mutate(
+    violent_rate = violent_crime / total_crime,
+    arrest_rate = arrests / total_crime,
+    beat_label = paste("Beat", beat),
+    district_lab = paste("District", district_num)
+  )
+# Whorl ridge generator ####
+make_whorl_ridge <- function(r, phase = 0, roughness = 0.004, n = 1200) {
+  t <- seq(0, 2*pi, length.out = n)
+
+  rad <- r +
+    0.06 * sin(2*t + phase) +
+    0.03 * sin(5*t + 0.7*phase)
+
+  x <- 0.92 * rad * cos(t)
+  y <- 1.18 * rad * sin(t)
+
+  x <- x + 0.22 * exp(-((t - 1.2)^2) / 0.9) - 0.10 * exp(-((t - 4.5)^2) / 0.6)
+  y <- y + 0.08 * sin(t - 0.8)
+
+  x <- x + roughness * sin(20*t + phase) + 0.5 * roughness * cos(33*t + 0.4*phase)
+  y <- y + roughness * cos(18*t + 0.3*phase)
+
+  tibble(x = x, y = y, t = t)
+}
+
+# Smudge / degradation mask ####
+apply_smudge <- function(df, strength = 0.22) {
+  smudge_base <- df$x + 0.7 * df$y
+  smudge_scaled <- scales::rescale(smudge_base, to = c(0, 1), na.rm = TRUE)
+
+  keep_prob <- 1 - strength * pmax(0, smudge_scaled)
+  keep_prob[is.na(keep_prob)] <- 1
+
+  keep <- runif(nrow(df)) < keep_prob
+  keep[is.na(keep)] <- TRUE
+
+  out <- df
+  out[!keep, c("x", "y")] <- NA
+  out
+}
+
+# Build ridges ####
+build_whorl_fingerprint <- function(df_one_district) {
+  df_one_district <- df_one_district %>%
+    arrange(dist_center) %>%
+    mutate(r_val = seq(0.18, 1.48, length.out = n()))
+
+  beat_levels <- levels(df_one_district$beat)
+  ridge_list <- vector("list", length(beat_levels))
+
+  for (i in seq_along(beat_levels)) {
+    seg <- df_one_district %>% filter(beat == beat_levels[i])
+
+    ridge <- make_whorl_ridge(
+      r = seg$r_val[1],
+      phase = i * 0.25,
+      roughness = seg$roughness[1],
+      n = 700
+    )
+
+    ridge <- apply_smudge(ridge, strength = 0.18)
+
+    ridge$district_num <- seg$district_num[1]
+    ridge$district_lab <- seg$district_lab[1]
+    ridge$beat <- as.character(seg$beat[1])
+    ridge$total_crime <- seg$total_crime[1]
+    ridge$violent_rate_plot <- seg$violent_rate_plot[1]
+    ridge$ridge_width <- seg$ridge_width[1]
+    ridge$ridge_alpha <- seg$ridge_alpha[1]
+    ridge$group_id <- paste0("district", seg$district_num[1], "_ridge", i)
+    ridge$x <- ridge$x * 1.12
+    ridge$y <- ridge$y * 1.12
+    ridge_list[[i]] <- ridge
+  }
+  bind_rows(ridge_list)
+}
+
+# fp_whorl setup ####
+precomputed_fp <- vector("list", length = 6)
+names(precomputed_fp) <- as.character(2020:2025)
+for (yr in 2020:2025) {
+  finger_year <- yearly_finger %>% filter(year == yr)
+  finger_df2 <- finger_year %>%
+    group_by(district_num) %>%
+    mutate(
+      district_lon = mean(lon, na.rm = TRUE),
+      district_lat = mean(lat, na.rm = TRUE),
+      dist_center = sqrt((lon - district_lon)^2 + (lat - district_lat)^2)
+    ) %>%
+    arrange(district_num, dist_center, .by_group = TRUE) %>%
+    mutate(
+      beat = factor(beat_label, levels = beat_label),
+      ridge_width = scales::rescale(rank(violent_rate), to = c(0.5, 4.2)),
+      ridge_alpha = scales::rescale(arrest_rate, to = c(0.45, 0.95)),
+      crime_cv = dplyr::coalesce(crime_cv, median(crime_cv, na.rm = TRUE)),
+      roughness = scales::rescale(crime_cv, to = c(0.001, 0.010)),
+      violent_rate_plot = violent_rate
+    ) %>%
+    ungroup()
+  fp_whorl <- finger_df2 %>%
+    group_split(district_num) %>%
+    lapply(build_whorl_fingerprint) %>%
+    bind_rows()
+  precomputed_fp[[as.character(yr)]] <- fp_whorl
+}
+```
+
+```{r}
+#| context: server
+output$fp_plot <- renderPlot({
+  yr <- input$year
+  set.seed(405)
+  finger_year <- yearly_finger %>% filter(year == input$year)
+  req(nrow(finger_year) > 0)
+  finger_df2 <- finger_year %>%
+    group_by(district_num) %>%
+    mutate(
+      district_lon = mean(lon, na.rm = TRUE),
+      district_lat = mean(lat, na.rm = TRUE),
+      dist_center = sqrt((lon - district_lon)^2 + (lat - district_lat)^2)
+    ) %>%
+    arrange(district_num, dist_center, .by_group = TRUE) %>%
+    mutate(
+      beat = factor(beat_label, levels = beat_label),
+      ridge_width = scales::rescale(rank(violent_rate), to = c(0.5, 4.2)),
+      ridge_alpha = scales::rescale(arrest_rate, to = c(0.45, 0.95)),
+      crime_cv = ifelse(is.na(crime_cv), median(crime_cv, na.rm = TRUE), crime_cv),
+      roughness = scales::rescale(crime_cv, to = c(0.001, 0.010)),
+      violent_rate_plot = violent_rate
+    ) %>%
+    ungroup()
+  
+  fp_whorl <- precomputed_fp[[as.character(input$year)]]
+  core_extra <- finger_df2 %>%
+    group_by(district_num, district_lab) %>%
+    group_map(~{
+      inner_df <- .x %>% slice_tail(n = min(5, nrow(.x)))
+  
+      bind_rows(lapply(seq_len(nrow(inner_df)), function(j) {
+        seg <- inner_df %>% slice(j)
+        ridge <- make_whorl_ridge(
+          r = c(0.035, 0.055, 0.075, 0.090, 0.105)[j],
+          phase = 2 + j * 0.18,
+          roughness = seg$roughness * 0.5,
+          n = 700
+        )
+        ridge$district_num <- .y$district_num[1]
+        ridge$district_lab <- .y$district_lab[1]
+        ridge$beat <- as.character(seg$beat[1])
+        ridge$total_crime <- seg$total_crime[1]
+        ridge$violent_rate_plot <- seg$violent_rate_plot[1]
+        ridge$ridge_width <- max(0.35, seg$ridge_width[1] * 0.8)
+        ridge$ridge_alpha <- seg$ridge_alpha[1]
+        ridge$group_id <- paste0("district", .y$district_num[1], "_core", j)
+        ridge
+      }))
+    }) %>%
+    bind_rows()
+  
+  fp_whorl <- bind_rows(fp_whorl, core_extra) %>%
+    filter(!is.na(district_lab)) %>%
+    mutate(
+      district_lab = factor(
+        district_lab,
+        levels = c("District 1", "District 6", "District 7",
+                   "District 9", "District 11", "District 15")
+      )
+    )
+
+  beat_labels <- fp_whorl %>%
+    filter(!grepl("_core", group_id)) %>%
+    filter(!is.na(x), !is.na(y)) %>%
+    group_by(district_lab, group_id, beat, total_crime) %>%
+    slice_max(order_by = x, n = 1, with_ties = FALSE) %>%
+    ungroup() %>%
+    group_by(district_lab) %>%
+    arrange(desc(total_crime), .by_group = TRUE) %>%
+    slice_head(n = 4) %>%
+    ungroup()
+  if (nrow(beat_labels) == 0) beat_labels <- NULL
+
+  ggplot(
+    fp_whorl,
+    aes(
+      x = x, y = y, group = group_id,
+      color = violent_rate_plot,
+      linewidth = ridge_width,
+      alpha = ridge_alpha
+    )
+  ) +
+    geom_path(lineend = "round", linejoin = "round", na.rm = TRUE) +
+    geom_label_repel(
+      data = beat_labels,
+      aes(x = x, y = y, label = beat),
+      inherit.aes = FALSE,
+      color = "black",
+      size = 2.6,
+      fontface = "bold",
+      box.padding = 0.16,
+      point.padding = 0.06,
+      label.size = 0.15,
+      min.segment.length = 0,
+      segment.color = "#4a3428",
+      segment.size = 0.22,
+      fill = scales::alpha("white", 0.82),
+      seed = 123,
+      max.overlaps = Inf,
+      show.legend = FALSE
+    ) +
+    facet_wrap(~ district_lab, ncol = 3, drop = TRUE) +
+    coord_equal(xlim = c(-1.55, 1.95), ylim = c(-1.75, 1.70), clip = "off") +
+    scale_color_gradient(
+      low = "#f6d6d6",
+      high = "#8b0000",
+      name = "Violence rate",
+      labels = scales::percent_format(accuracy = 1)
+    ) +
+    scale_linewidth(range = c(0.35, 1.8), guide = "none") +
+    scale_alpha(range = c(0.45, 0.92), guide = "none") +
+    labs(
+      title = paste("Crime Fingerprints by Police District,", yr),
+      subtitle = "Ridges are ordered by beat distance from each district center"
+    ) +
+    theme_void()
+}, res = 120)
+```
+
+## Conclusion
+
+-   main findings
+-   limitations
+-   future work
+
+
+```{r}
+#| context: setup
+onStop(function() {
+  if (DBI::dbIsValid(con)) DBI::dbDisconnect(con)
+})
+```
