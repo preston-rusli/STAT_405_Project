@@ -971,7 +971,7 @@ The results reveal that streets and residences are by far the most common settin
 
 {{< pagebreak >}}
 
-```{r}
+```{r, echo=FALSE, warning=FALSE, message=FALSE, fig.align='center', fig.width=8, fig.height=8}
 library(DBI)
 library(dplyr)
 library(ggplot2)
@@ -986,6 +986,7 @@ library(zoo)
 library(tidyr)
 library(stringr)
 library(kableExtra)
+
 crime_recent <- dbGetQuery(con, "
 WITH base AS (
   SELECT
@@ -1038,16 +1039,23 @@ crime_recent <- crime_recent %>%
     Arrest01 = as.integer(Arrest01)
   )
 
-crime_lm <- lm(Arrest01 ~ Hour + Year + Domestic * Primary_Type, data = crime_recent)
+# Logistic regression
+crime_glm <- glm(
+  Arrest01 ~ Hour + Year + Domestic * Primary_Type,
+  data = crime_recent,
+  family = binomial()
+)
 
-lm_sum <- summary(crime_lm)
+glm_sum <- summary(crime_glm)
 
-adj_r2 <- lm_sum$adj.r.squared
-f_stat <- lm_sum$fstatistic
-f_value <- unname(f_stat["value"])
-df1 <- unname(f_stat["numdf"])
-df2 <- unname(f_stat["dendf"])
-p_value <- pf(f_value, df1, df2, lower.tail = FALSE)
+# Likelihood ratio test against null model
+null_dev <- crime_glm$null.deviance
+resid_dev <- crime_glm$deviance
+df_null <- crime_glm$df.null
+df_resid <- crime_glm$df.residual
+lr_stat <- null_dev - resid_dev
+lr_df <- df_null - df_resid
+lr_p_value <- pchisq(lr_stat, df = lr_df, lower.tail = FALSE)
 
 format_p_sci <- function(x) {
   ifelse(x < 0.001, format(x, scientific = TRUE, digits = 2), sprintf("%.4f", x))
@@ -1055,27 +1063,38 @@ format_p_sci <- function(x) {
 
 fit_table <- tibble(
   Metric = c(
-    "Adjusted R-squared",
-    "F-statistic",
-    "Numerator df",
-    "Denominator df",
+    "AIC",
+    "Null deviance",
+    "Residual deviance",
+    "Likelihood ratio chi-square",
+    "Model df",
+    "Residual df",
     "Model p-value"
   ),
   Value = c(
-    round(adj_r2, 4),
-    round(f_value, 2),
-    df1,
-    df2,
-    format_p_sci(p_value)
+    round(AIC(crime_glm), 2),
+    round(null_dev, 2),
+    round(resid_dev, 2),
+    round(lr_stat, 2),
+    lr_df,
+    df_resid,
+    format_p_sci(lr_p_value)
   )
 )
 
 kable(
   fit_table,
-  caption = "Linear Probability Model Fit Statistics for Arrest"
+  caption = "Logistic Regression Fit Statistics for Arrest"
 )
 
-coef_table <- tidy(crime_lm, conf.int = TRUE) %>%
+coef_table <- tidy(crime_glm) %>%
+  mutate(
+    conf.low = estimate - 1.96 * std.error,
+    conf.high = estimate + 1.96 * std.error,
+    odds_ratio = exp(estimate),
+    or_low = exp(conf.low),
+    or_high = exp(conf.high)
+  ) %>%
   mutate(
     term = recode(
       term,
@@ -1090,12 +1109,18 @@ coef_table <- tidy(crime_lm, conf.int = TRUE) %>%
     term = str_replace_all(term, "DomesticTRUE:", "Domestic incident × "),
     term = str_replace_all(term, "Domestic1:", "Domestic incident × "),
     term = str_replace_all(term, ":", " × "),
+    term = str_to_title(term),
+    term = str_replace(term, "^Crime Type", "Crime type"),
+    term = str_replace(term, "^Domestic Incident", "Domestic incident"),
     estimate  = round(estimate, 4),
     std.error = round(std.error, 4),
     statistic = round(statistic, 4),
-    p.value   = format_p_sci(p.value)
+    p.value   = format_p_sci(p.value),
+    odds_ratio = round(odds_ratio, 4),
+    or_low = round(or_low, 4),
+    or_high = round(or_high, 4)
   ) %>%
-  select(term, estimate, std.error, statistic, p.value)
+  select(term, estimate, std.error, statistic, p.value, odds_ratio, or_low, or_high)
 
 kable(
   coef_table,
@@ -1103,16 +1128,15 @@ kable(
   booktabs = TRUE,
   longtable = TRUE,
   linesep = "",
-  caption = "Regression Coefficients for Arrest on Hour, Year, Domestic Incident, Crime Type, and Their Interaction",
-  col.names = c("Term", "Estimate", "Std. Error", "t-statistic", "p-value"),
-  align = c("p{7cm}", "r", "r", "r", "r")
+  caption = "Logistic Regression Coefficients for Arrest on Hour, Year, Domestic Incident, Crime Type, and Their Interaction",
+  col.names = c("Term", "Log-odds", "Std. Error", "z-statistic", "p-value", "Odds Ratio", "OR 2.5%", "OR 97.5%"),
+  align = c("p{6.2cm}", "r", "r", "r", "r", "r", "r", "r")
 ) %>%
   kable_styling(
     latex_options = c("repeat_header", "hold_position"),
-    font_size = 9
+    font_size = 8
   )
 ```
-
 \begin{large}
 \textbf{Statistical Modeling: Regression}
 \end{large}
