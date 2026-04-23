@@ -8,7 +8,7 @@ author:
 date: "23 April 2026"
 format:
   revealjs:
-    theme: simple
+    theme: blood
     slide-number: true
     incremental: true
     embed-resources: true
@@ -650,7 +650,14 @@ output$fp_plot <- renderPlot({
     slice_head(n = 4) %>%
     ungroup()
   if (nrow(beat_labels) == 0) beat_labels <- NULL
-
+  radioButtons(
+  "color_metric", "Color by:",
+  choices = c("Violence rate" = "violent_rate_plot",
+              "Arrest rate" = "arrest_rate",
+              "Total crime" = "total_crime",
+              "Volatility" = "crime_cv"),
+  inline = TRUE
+  )
   ggplot(
     fp_whorl,
     aes(
