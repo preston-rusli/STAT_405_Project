@@ -8,7 +8,7 @@ author:
 date: "23 April 2026"
 format:
   revealjs:
-    theme: simple
+    theme: blood
     slide-number: true
     incremental: true
     embed-resources: true
@@ -143,7 +143,7 @@ ORDER BY crime_count DESC;")
 
 ## Weekly Crime Trend
 
-```{r, echo=FALSE, warning=FALSE, message=FALSE, fig.align='center'}
+```{r, echo=FALSE, warning=FALSE, message=FALSE, fig.align='left'}
 #| fig-width: 8
 #| fig-height: 6
 crime_weekly <- dbGetQuery(con, "
@@ -239,6 +239,149 @@ ggplot(crime_weekly, aes(x = week, y = count)) +
   )
 ```
 
+```{r, echo=FALSE, warning=FALSE, message=FALSE, fig.align='right'}
+
+library(DBI)
+library(sf)
+library(dplyr)
+library(ggplot2)
+library(readr)
+library(scales)
+library(stringr)
+library(ggrepel)
+library(tidyr)
+library(grid)
+
+# Crime aggregation in SQLite
+crime_by_area <- dbGetQuery(con, "
+  SELECT
+    CAST([Community Area] AS INTEGER) AS Community_Area,
+    COUNT(*) AS crime_total_2020_2024,
+    COUNT(*) / 5.0 AS crime_avg_per_year
+  FROM crimes_clean
+  WHERE Date IS NOT NULL
+    AND [Community Area] IS NOT NULL
+    AND CAST(substr(Date, 7, 4) AS INTEGER) BETWEEN 2020 AND 2024
+  GROUP BY CAST([Community Area] AS INTEGER)
+  ORDER BY Community_Area
+")
+
+areas <- st_read("Boundaries_-_Community_Areas.geojson", quiet = TRUE) %>%
+  mutate(
+    Community_Area = as.integer(area_numbe),
+    comm_name = str_to_upper(str_squish(community))
+  )
+
+pop <- read_csv("acs_community_area_population.csv", show_col_types = FALSE) %>%
+  transmute(
+    comm_name = str_to_upper(str_squish(`Community Area`)),
+    population = as.numeric(`Total Population`)
+  )
+
+map_df <- areas %>%
+  left_join(crime_by_area, by = "Community_Area") %>%
+  left_join(pop, by = "comm_name") %>%
+  mutate(
+    crime_avg_per_year = replace_na(crime_avg_per_year, 0),
+    crimes_per_1000_per_year = if_else(
+      !is.na(population) & population > 0,
+      1000 * crime_avg_per_year / population,
+      NA_real_
+    )
+  )
+
+# cap max values for better color contrast
+cap <- quantile(map_df$crimes_per_1000_per_year, 0.95, na.rm = TRUE)
+map_df <- map_df %>%
+  mutate(rate_plot = pmin(crimes_per_1000_per_year, cap))
+
+# top 5 labels by rate
+top5 <- map_df %>%
+  st_drop_geometry() %>%
+  filter(is.finite(crimes_per_1000_per_year)) %>%
+  arrange(desc(crimes_per_1000_per_year)) %>%
+  slice(1:5) %>%
+  transmute(
+    Community_Area,
+    comm_name,
+    rate = crimes_per_1000_per_year
+  )
+
+label_pts <- st_point_on_surface(map_df)
+
+label_df <- label_pts %>%
+  left_join(top5, by = "Community_Area") %>%
+  filter(!is.na(rate))
+
+label_xy <- label_df %>%
+  mutate(
+    x = st_coordinates(geometry)[, 1],
+    y = st_coordinates(geometry)[, 2],
+    label = paste0(str_to_title(comm_name.x), "\n", sprintf("%.1f", rate))
+  ) %>%
+  st_drop_geometry()
+
+ggplot(map_df) +
+  geom_sf(aes(fill = rate_plot), color = "white", linewidth = 0.2) +
+  geom_label_repel(
+    data = label_xy,
+    aes(x = x, y = y, label = label),
+    size = 3,
+    fill = "white",
+    alpha = 0.85,
+    label.size = 0,
+    box.padding = 0.35,
+    point.padding = 0.2,
+    min.segment.length = 0,
+    segment.size = 0.3,
+    segment.alpha = 0.8,
+    max.overlaps = Inf
+  ) +
+  scale_fill_viridis_c(
+    option = "C",
+    trans = "sqrt",
+    direction = -1,
+    breaks = pretty_breaks(n = 5),
+    labels = ~ sprintf("%.1f", .x),
+    name = "Crimes per 1,000 per year",
+    na.value = "grey90"
+  ) +
+  guides(fill = guide_colorbar(
+    title.position = "top",
+    title.hjust = 0.5,
+    label.position = "bottom",
+    barwidth = unit(4.5, "in"),
+    barheight = unit(0.25, "in"),
+    ticks = TRUE
+  )) +
+  coord_sf(datum = NA) +
+  labs(
+    title = "Average Annual Crime Rate by Community Area (2020–2024)",
+    subtitle = "Rate = (average yearly crimes in 2020–2024) / (ACS 2023 population), per 1,000 residents",
+    caption = paste0(
+      "Sources: City of Chicago Data Portal (crimes, 2020–2024); ACS community area population (2023).\n",
+      "Color scale capped at the 95th percentile for readability."
+    )
+  ) +
+  theme_minimal(base_size = 12) +
+  theme(
+    panel.grid = element_blank(),
+    axis.title = element_blank(),
+    axis.text = element_blank(),
+    axis.ticks = element_blank(),
+    legend.position = "bottom",
+    legend.title = element_text(size = 11),
+    legend.text = element_text(size = 10),
+    legend.box.margin = margin(t = 6, r = 0, b = 0, l = 0),
+    legend.margin = margin(t = 2, r = 2, b = 2, l = 2),
+    plot.title = element_text(size = 15, face = "bold"),
+    plot.subtitle = element_text(size = 11),
+    plot.caption = element_text(size = 9),
+    plot.margin = margin(10, 10, 10, 10)
+  )
+```
+
+
 -   Reported crime shows a strong long-run decline from the early 2000s into roughly the mid-2010s.
 -   There is a visible disruption around 2020–2021 near the COVID-19 marker.
 -   The repeating peaks and dips suggest a seasonal cycle on top of the long-run trend.
@@ -292,9 +435,6 @@ ggplot(hour_counts, aes(x = HourLabel, y = crime_count)) +
 -   Reported crime is lowest in the early morning, especially around 4 AM to 6 AM, and rises steadily through the day.
 -   Crime activity peaks in the late afternoon and evening, especially around 3 PM and 6 PM to 9 PM, before declining again later at night.
 
-## Monthly heatmap
-
-\[plot\] - 2 takeaways
 
 ## Community area crime map
 ::: columns
@@ -650,7 +790,14 @@ output$fp_plot <- renderPlot({
     slice_head(n = 4) %>%
     ungroup()
   if (nrow(beat_labels) == 0) beat_labels <- NULL
-
+  radioButtons(
+  "color_metric", "Color by:",
+  choices = c("Violence rate" = "violent_rate_plot",
+              "Arrest rate" = "arrest_rate",
+              "Total crime" = "total_crime",
+              "Volatility" = "crime_cv"),
+  inline = TRUE
+  )
   ggplot(
     fp_whorl,
     aes(
